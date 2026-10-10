@@ -71,26 +71,36 @@ impl Value {
 
 enum Tok {
     Text(String),
-    Out(String),
-    Tag(String),
+    Out(String, usize),
+    Tag(String, usize),
 }
 
+// Nodes carry the template line they came from, for error messages.
 #[derive(Clone)]
 enum Node {
     Text(String),
-    Out(String),
-    If(Vec<(String, Vec<Node>)>),
-    For { var: String, list: String, body: Vec<Node> },
-    Include { name: String, args: Vec<(String, String)> },
-    Extends(String),
-    Block { name: String, body: Vec<Node> },
+    Out { expr: String, line: usize },
+    If(Vec<(String, Vec<Node>, usize)>),
+    For { var: String, list: String, body: Vec<Node>, line: usize },
+    Include { name: String, args: Vec<(String, String)>, line: usize },
+    Extends(String, usize),
+    Block { name: String, body: Vec<Node>, line: usize },
 }
 
-/// Position of the next `{{` or `{%`, in one pass (searching for each separately is quadratic).
+/// Appends the template line to an error message.
+fn at(msg: impl std::fmt::Display, line: usize) -> String {
+    format!("{msg} (line {line})")
+}
+
+fn newlines(s: &str) -> usize {
+    s.bytes().filter(|&b| b == b'\n').count()
+}
+
+/// Position of the next `{{`, `{%` or `{#`, in one pass (searching for each separately is quadratic).
 fn next_open(s: &str) -> Option<usize> {
     let mut from = 0;
     while let Some(p) = s[from..].find('{').map(|p| p + from) {
-        if matches!(s.as_bytes().get(p + 1), Some(b'{' | b'%')) {
+        if matches!(s.as_bytes().get(p + 1), Some(b'{' | b'%' | b'#')) {
             return Some(p);
         }
         from = p + 1;
@@ -98,19 +108,54 @@ fn next_open(s: &str) -> Option<usize> {
     None
 }
 
+/// Finds the tag `{% name %}` in `s`: returns the offset of the tag and its length.
+/// Tags are split the same way `tokenize` does, so this is linear too.
+fn find_end_tag(s: &str, name: &str) -> Option<(usize, usize)> {
+    let mut from = 0;
+    while let Some(p) = s[from..].find("{%").map(|p| p + from) {
+        let e = s[p + 2..].find("%}")?;
+        if s[p + 2..p + 2 + e].trim() == name {
+            return Some((p, e + 4));
+        }
+        from = p + 2 + e + 2;
+    }
+    None
+}
+
 fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let mut toks = Vec::new();
-    let mut rest = src;
+    let (mut rest, mut line) = (src, 1);
     while let Some(pos) = next_open(rest) {
         if pos > 0 {
             toks.push(Tok::Text(rest[..pos].into()));
+            line += newlines(&rest[..pos]);
         }
-        let (close, is_out) = if rest[pos..].starts_with("{{") { ("}}", true) } else { ("%}", false) };
+        let close = match &rest[pos..pos + 2] {
+            "{{" => "}}",
+            "{%" => "%}",
+            _ => "#}",
+        };
         let inner = &rest[pos + 2..];
-        let end = inner.find(close).ok_or(format!("Unclosed delimiter: missing '{close}'"))?;
-        let body = inner[..end].trim().to_string();
-        toks.push(if is_out { Tok::Out(body) } else { Tok::Tag(body) });
-        rest = &inner[end + 2..];
+        let end = inner.find(close).ok_or_else(|| at(format!("Unclosed delimiter: missing '{close}'"), line))?;
+        let body = inner[..end].trim();
+        let mut consumed = pos + 2 + end + 2;
+        match (close, body) {
+            ("}}", _) => toks.push(Tok::Out(body.into(), line)),
+            ("#}", _) => {} // inline comment
+            // `raw` keeps its content as text and `comment` drops it; neither is parsed.
+            ("%}", "raw" | "comment") => {
+                let end_tag = if body == "raw" { "endraw" } else { "endcomment" };
+                let after = &rest[consumed..];
+                let (len, tag) = find_end_tag(after, end_tag).ok_or_else(|| at(format!("Unclosed block: missing '{end_tag}'"), line))?;
+                if body == "raw" && len > 0 {
+                    toks.push(Tok::Text(after[..len].into()));
+                }
+                consumed += len + tag;
+            }
+            _ => toks.push(Tok::Tag(body.into(), line)),
+        }
+        line += newlines(&rest[pos..consumed]);
+        rest = &rest[consumed..];
     }
     if !rest.is_empty() {
         toks.push(Tok::Text(rest.into()));
@@ -118,8 +163,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     Ok(toks)
 }
 
+/// The tag that ended a block: its name, its argument and its line.
+type Stop = Option<(String, String, usize)>;
+
 /// Reads nodes until one of the tags in `stop`; returns the tag that ended the block.
-fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Vec<Node>, Option<(String, String)>), String> {
+fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Vec<Node>, Stop), String> {
     if depth > MAX_NESTING {
         return Err(format!("Template nested too deeply (max {MAX_NESTING} levels)"));
     }
@@ -129,26 +177,28 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Ve
         *i += 1;
         match tok {
             Tok::Text(t) => nodes.push(Node::Text(t.clone())),
-            Tok::Out(e) => {
+            Tok::Out(e, line) => {
                 if e.is_empty() {
-                    return Err("Variable name cannot be empty".into());
+                    return Err(at("Variable name cannot be empty", *line));
                 }
-                nodes.push(Node::Out(e.clone()))
+                nodes.push(Node::Out { expr: e.clone(), line: *line })
             }
-            Tok::Tag(tag) => {
+            Tok::Tag(tag, line) => {
+                let line = *line;
                 let (name, arg) = tag.split_once(char::is_whitespace).unwrap_or((tag, ""));
                 let arg = arg.trim();
                 if stop.contains(&name) {
-                    return Ok((nodes, Some((name.into(), arg.into()))));
+                    return Ok((nodes, Some((name.into(), arg.into(), line))));
                 }
                 match name {
                     "if" => {
                         let mut branches = Vec::new();
-                        let mut cond = arg.to_string();
+                        let (mut cond, mut cond_line) = (arg.to_string(), line);
                         loop {
                             let (body, end) = block(toks, i, &["elsif", "else", "endif"], depth + 1)?;
-                            branches.push((cond, body));
-                            let (end, a) = end.ok_or("Unclosed block: missing 'endif'")?;
+                            branches.push((cond, body, cond_line));
+                            let (end, a, l) = end.ok_or_else(|| at("Unclosed block: missing 'endif'", line))?;
+                            cond_line = l;
                             match end.as_str() {
                                 "endif" => break,
                                 "else" => cond = "true".into(),
@@ -158,25 +208,25 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Ve
                         nodes.push(Node::If(branches));
                     }
                     "for" => {
-                        let (var, list) = arg.split_once(" in ").ok_or(format!("Invalid for tag: {tag}"))?;
+                        let (var, list) = arg.split_once(" in ").ok_or_else(|| at(format!("Invalid for tag: {tag}"), line))?;
                         let (body, end) = block(toks, i, &["endfor"], depth + 1)?;
-                        end.ok_or("Unclosed block: missing 'endfor'")?;
-                        nodes.push(Node::For { var: var.trim().into(), list: list.trim().into(), body });
+                        end.ok_or_else(|| at("Unclosed block: missing 'endfor'", line))?;
+                        nodes.push(Node::For { var: var.trim().into(), list: list.trim().into(), body, line });
                     }
-                    "include" => nodes.push(parse_include("include", arg)?),
-                    "extends" => match parse_include("extends", arg)? {
-                        Node::Include { name, args } if args.is_empty() => nodes.push(Node::Extends(name)),
-                        _ => return Err("extends takes only a quoted template name".into()),
+                    "include" => nodes.push(parse_include("include", arg, line).map_err(|e| at(e, line))?),
+                    "extends" => match parse_include("extends", arg, line).map_err(|e| at(e, line))? {
+                        Node::Include { name, args, .. } if args.is_empty() => nodes.push(Node::Extends(name, line)),
+                        _ => return Err(at("extends takes only a quoted template name", line)),
                     },
                     "block" => {
                         if arg.is_empty() || !arg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-                            return Err(format!("Invalid block name: '{arg}'"));
+                            return Err(at(format!("Invalid block name: '{arg}'"), line));
                         }
                         let (body, end) = block(toks, i, &["endblock"], depth + 1)?;
-                        end.ok_or("Unclosed block: missing 'endblock'")?;
-                        nodes.push(Node::Block { name: arg.into(), body });
+                        end.ok_or_else(|| at("Unclosed block: missing 'endblock'", line))?;
+                        nodes.push(Node::Block { name: arg.into(), body, line });
                     }
-                    _ => return Err(format!("Unknown tag: {name}")),
+                    _ => return Err(at(format!("Unknown tag: {name}"), line)),
                 }
             }
         }
@@ -185,7 +235,7 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Ve
 }
 
 /// `"name"` or `"name" with a = expr, b = expr`. The name must be a quoted literal.
-fn parse_include(tag: &str, arg: &str) -> Result<Node, String> {
+fn parse_include(tag: &str, arg: &str, line: usize) -> Result<Node, String> {
     let bad = || format!("{tag} needs a quoted template name");
     let q = arg.chars().next().filter(|c| matches!(c, '"' | '\'')).ok_or_else(bad)?;
     let rest = &arg[1..];
@@ -203,7 +253,7 @@ fn parse_include(tag: &str, arg: &str) -> Result<Node, String> {
             args.push((k.to_string(), v.trim().to_string()));
         }
     }
-    Ok(Node::Include { name: rest[..end].to_string(), args })
+    Ok(Node::Include { name: rest[..end].to_string(), args, line })
 }
 
 /// Splits on `sep`, ignoring occurrences inside quotes.
@@ -229,13 +279,13 @@ fn split_top(s: &str, sep: char) -> Vec<&str> {
 fn collect_blocks(nodes: &[Node], map: &mut HashMap<String, Vec<Node>>) -> Result<(), String> {
     for n in nodes {
         match n {
-            Node::Block { name, body } => {
+            Node::Block { name, body, line } => {
                 if map.insert(name.clone(), body.clone()).is_some() {
-                    return Err(format!("Duplicate block '{name}'"));
+                    return Err(at(format!("Duplicate block '{name}'"), *line));
                 }
                 collect_blocks(body, map)?;
             }
-            Node::If(branches) => branches.iter().try_for_each(|(_, b)| collect_blocks(b, map))?,
+            Node::If(branches) => branches.iter().try_for_each(|(_, b, _)| collect_blocks(b, map))?,
             Node::For { body, .. } => collect_blocks(body, map)?,
             _ => {}
         }
@@ -248,12 +298,12 @@ fn substitute(nodes: Vec<Node>, ov: &HashMap<String, Vec<Node>>) -> Vec<Node> {
     nodes
         .into_iter()
         .map(|n| match n {
-            Node::Block { name, body } => {
+            Node::Block { name, body, line } => {
                 let body = ov.get(&name).cloned().unwrap_or_else(|| substitute(body, ov));
-                Node::Block { name, body }
+                Node::Block { name, body, line }
             }
-            Node::If(branches) => Node::If(branches.into_iter().map(|(c, b)| (c, substitute(b, ov))).collect()),
-            Node::For { var, list, body } => Node::For { var, list, body: substitute(body, ov) },
+            Node::If(branches) => Node::If(branches.into_iter().map(|(c, b, l)| (c, substitute(b, ov), l)).collect()),
+            Node::For { var, list, body, line } => Node::For { var, list, body: substitute(body, ov), line },
             n => n,
         })
         .collect()
@@ -266,18 +316,18 @@ fn load(src: &str, partials: &Partials, depth: usize) -> Result<Vec<Node>, Strin
     let (nodes, _) = block(&toks, &mut 0, &[], 0)?;
     let mut own = HashMap::new();
     collect_blocks(&nodes, &mut own)?;
-    let Some(i) = nodes.iter().position(|n| matches!(n, Node::Extends(_))) else {
+    let Some(i) = nodes.iter().position(|n| matches!(n, Node::Extends(..))) else {
         return Ok(nodes);
     };
+    let Node::Extends(parent, line) = &nodes[i] else { unreachable!() };
     let first = nodes[..i].iter().all(|n| matches!(n, Node::Text(t) if t.trim().is_empty()));
-    if !first || nodes[i + 1..].iter().any(|n| matches!(n, Node::Extends(_))) {
-        return Err("extends must be the first tag of a template, and used once".into());
+    if !first || nodes[i + 1..].iter().any(|n| matches!(n, Node::Extends(..))) {
+        return Err(at("extends must be the first tag of a template, and used once", *line));
     }
-    let Node::Extends(parent) = &nodes[i] else { unreachable!() };
     if depth >= MAX_INCLUDE_DEPTH {
-        return Err(format!("Extends nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{parent}'"));
+        return Err(at(format!("Extends nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{parent}'"), *line));
     }
-    let psrc = partials.get(parent).ok_or(format!("Unknown template: {parent}"))?;
+    let psrc = partials.get(parent).ok_or_else(|| at(format!("Unknown template: {parent}"), *line))?;
     let base = load(psrc, partials, depth + 1).map_err(|e| format!("{e} (in '{parent}')"))?;
     Ok(substitute(base, &own))
 }
@@ -433,7 +483,7 @@ fn cond_tokens(s: &str) -> Result<Vec<String>, String> {
     Ok(toks)
 }
 
-/// Grammatica: or := and ("or" and)* ; and := cmp ("and" cmp)* ; cmp := atom [op atom] ; atom := "(" or ")" | value.
+/// Grammar: or := and ("or" and)* ; and := cmp ("and" cmp)* ; cmp := atom [op atom] ; atom := "(" or ")" | value.
 struct Cond<'a> {
     toks: Vec<String>,
     i: usize,
@@ -535,23 +585,26 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
         }
         match n {
             Node::Text(t) => emit(out, t)?,
-            Node::Out(e) => emit(out, &output(e, env)?.show())?,
+            Node::Out { expr, line } => {
+                let shown = output(expr, env).map_err(|e| at(e, *line))?.show();
+                emit(out, &shown).map_err(|e| at(e, *line))?
+            }
             Node::If(branches) => {
-                for (c, body) in branches {
-                    if condition(c, env)? {
+                for (c, body, line) in branches {
+                    if condition(c, env).map_err(|e| at(e, *line))? {
                         run(body, env, out)?;
                         break;
                     }
                 }
             }
-            Node::Include { name, args } => {
-                let src = env.partials.get(name).ok_or(format!("Unknown template: {name}"))?;
+            Node::Include { name, args, line } => {
+                let src = env.partials.get(name).ok_or_else(|| at(format!("Unknown template: {name}"), *line))?;
                 if env.depth >= MAX_INCLUDE_DEPTH {
-                    return Err(format!("Include nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{name}'"));
+                    return Err(at(format!("Include nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{name}'"), *line));
                 }
                 env.includes += 1;
                 if env.includes > MAX_INCLUDES {
-                    return Err(format!("Too many includes (max {MAX_INCLUDES})"));
+                    return Err(at(format!("Too many includes (max {MAX_INCLUDES})"), *line));
                 }
                 let nodes = match env.cache.get(name) {
                     Some(n) => n.clone(),
@@ -572,8 +625,8 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
                 r?;
             }
             Node::Block { body, .. } => run(body, env, out)?,
-            Node::Extends(_) => return Err("extends must be the first tag of a template".into()),
-            Node::For { var, list, body } => {
+            Node::Extends(_, line) => return Err(at("extends must be the first tag of a template", *line)),
+            Node::For { var, list, body, line } => {
                 // ponytail: the list is cloned once per loop (so env isn't kept borrowed); use Rc if it gets costly.
                 let items = match value(list, env).into_owned() {
                     Value::List(l) => l,
@@ -587,7 +640,7 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
                     env.iterations += 1;
                     if env.iterations > MAX_ITERATIONS {
                         env.locals.truncate(base);
-                        return Err(format!("Too many loop iterations (max {MAX_ITERATIONS})"));
+                        return Err(at(format!("Too many loop iterations (max {MAX_ITERATIONS})"), *line));
                     }
                     let mut forloop = HashMap::from([
                         ("index".into(), Value::Num((k + 1) as f64)),
@@ -798,6 +851,44 @@ mod tests {
         let partials = Partials::from([("p".to_string(), "{% if false %}{% endif %}".repeat(3000))]);
         let err = render_with("{% for a in big %}{% include 'p' %}{% endfor %}", &c, &partials).unwrap_err();
         assert!(err.contains("too complex"), "{err}");
+    }
+
+    #[test]
+    fn comments_and_raw() {
+        let c = ctx(vec![("x", "v".into())]);
+        assert_eq!(render("a{# a {{ x }} comment #}b", &c).unwrap(), "ab");
+        assert_eq!(render("a{% comment %}{{ x }}{% if %}{% endcomment %}b", &c).unwrap(), "ab");
+        // Raw content is output as is, including template syntax.
+        assert_eq!(render("{% raw %}{{ x }} {% if %}{% endraw %}!{{ x }}", &c).unwrap(), "{{ x }} {% if %}!v");
+        assert_eq!(render("{% raw %}{% endraw %}x", &c).unwrap(), "x");
+        // Unclosed ones are errors, with the line where they start.
+        assert_eq!(render("a\n{% raw %}b", &c).unwrap_err(), "Unclosed block: missing 'endraw' (line 2)");
+        assert!(render("{% comment %}b", &c).unwrap_err().contains("endcomment"));
+        assert!(render("a{# b", &c).unwrap_err().contains("'#}'"));
+        // Lines keep counting through comments and raw blocks.
+        assert!(render("{# a\nb #}\n{% raw %}\n\n{% endraw %}\n{% nope %}", &c).unwrap_err().ends_with("(line 6)"));
+        // A very long run of `{%` without a closing tag stays linear.
+        assert!(render(&format!("{{% raw %}}{}", "{%".repeat(500_000)), &c).is_err());
+    }
+
+    #[test]
+    fn errors_have_line_numbers() {
+        let c = ctx(vec![("x", "v".into())]);
+        let partials = Partials::from([("p".to_string(), "ok\n{{ x | nope }}".to_string())]);
+        let err = |t: &str| render_with(t, &c, &partials).unwrap_err();
+        assert_eq!(err("a\nb\n{% nope %}"), "Unknown tag: nope (line 3)");
+        assert_eq!(err("{{ x }}\n{{ }}"), "Variable name cannot be empty (line 2)");
+        assert_eq!(err("{% if x %}\n\n{% block %}"), "Invalid block name: '' (line 3)");
+        assert_eq!(err("{% if x %}\n\n"), "Unclosed block: missing 'endif' (line 1)");
+        assert_eq!(err("{{ x\n\n"), "Unclosed delimiter: missing '}}' (line 1)");
+        // Runtime errors: unknown filter, bad condition (the `elsif` line), unknown template.
+        assert_eq!(err("\n{{ x | nope }}"), "Unknown filter: nope (line 2)");
+        assert_eq!(err("{% if false %}\n{% elsif (x %}\n{% endif %}"), "Invalid condition: missing ')' (line 2)");
+        assert_eq!(err("a\n\n{% include 'zz' %}"), "Unknown template: zz (line 3)");
+        // Errors inside an included template point to its own line.
+        assert_eq!(err("{% include 'p' %}"), "Unknown filter: nope (line 2) (in 'p')");
+        // Multi-line tags and outputs count their newlines.
+        assert!(err("{{ x\n}}\n{% nope %}").contains("(line 3)"));
     }
 
     #[test]

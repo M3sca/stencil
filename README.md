@@ -88,6 +88,16 @@ Operators: `== != < > <= >= contains`, combinable with `and`, `or` and parenthes
 
 Inside a loop, `forloop` exposes `index`, `index0`, `first`, `last` and `length`. The loop variable is not visible outside the loop. In nested loops, `forloop` describes the innermost loop and `forloop.parentloop` the enclosing one (chainable: `forloop.parentloop.parentloop.index`); in the outermost loop `forloop.parentloop` is empty.
 
+### Comments and literal text
+
+```text
+{# an inline comment #}
+{% comment %}a block comment, {{ never rendered }}{% endcomment %}
+{% raw %}{{ printed as is }} {% if x %}{% endraw %}
+```
+
+Comments produce no output. Inside `raw`, template syntax is not interpreted; use it to print `{{` and `{%` literally.
+
 ### Includes
 
 ```text
@@ -156,11 +166,11 @@ These are constants at the top of `src/lib.rs`. Each partial is parsed once per 
 
 ## Errors
 
-Unclosed delimiters or blocks, unknown tags and filters, empty variable names and invalid conditions return `Err` with a descriptive message.
+Unclosed delimiters or blocks, unknown tags and filters, empty variable names and invalid conditions return `Err` with a descriptive message that includes the template line, e.g. `Unknown filter: nope (line 3)`. An error inside an included template reads `... (line 2) (in 'name')`, with the line in that template.
 
 ## Not supported
 
-`assign`, `capture`, `unless`, `case`, whitespace control (`{%-`), `break`/`continue`, comments.
+`assign`, `capture`, `unless`, `case`, whitespace control (`{%-`), `break`/`continue`.
 
 ## Development
 
