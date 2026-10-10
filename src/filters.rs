@@ -48,6 +48,30 @@ fn count(args: &[Value], i: usize, filter: &str) -> Result<usize, String> {
     Ok(n as usize)
 }
 
+/// Filters supplied by the host program, tried before the built-in ones (so they can also replace them).
+///
+/// `call` returns `None` for a name it doesn't know. The host is trusted code that runs
+/// synchronously inside the render: it must not block for long, and its result is subject to
+/// the same size limits as any other value. A `HashMap<String, F>` of closures is a `FilterSet`.
+pub trait FilterSet {
+    fn call(&self, name: &str, value: &Value, args: &[Value]) -> Option<Result<Value, String>>;
+}
+
+impl<F: Fn(&Value, &[Value]) -> Result<Value, String>> FilterSet for std::collections::HashMap<String, F> {
+    fn call(&self, name: &str, value: &Value, args: &[Value]) -> Option<Result<Value, String>> {
+        self.get(name).map(|f| f(value, args))
+    }
+}
+
+/// No host filters.
+pub(crate) struct NoFilters;
+
+impl FilterSet for NoFilters {
+    fn call(&self, _: &str, _: &Value, _: &[Value]) -> Option<Result<Value, String>> {
+        None
+    }
+}
+
 pub(crate) fn apply_filter(name: &str, v: &Value, args: &[Value]) -> Result<Value, String> {
     let s = || v.show();
     let out = match name {

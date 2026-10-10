@@ -1,3 +1,4 @@
+use crate::FilterSet;
 use crate::limits::*;
 use crate::parse::Node;
 use crate::{Context, Partials, Value};
@@ -10,6 +11,7 @@ pub(crate) struct Env<'a> {
     pub(crate) globals: &'a Context,
     pub(crate) locals: Vec<(String, Value)>,
     pub(crate) partials: &'a Partials,
+    pub(crate) custom: &'a dyn FilterSet,
     pub(crate) depth: usize,
     pub(crate) includes: usize,
     pub(crate) iterations: usize,

@@ -2,10 +2,11 @@
 
 use crate::env::Env;
 use crate::expr::{condition, output, value};
+use crate::filters::NoFilters;
 use crate::inherit::load;
 use crate::limits::*;
 use crate::parse::{Node, at};
-use crate::{Context, Partials, Value};
+use crate::{Context, FilterSet, Partials, Value};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -178,12 +179,18 @@ pub fn render(template: &str, ctx: &Context) -> Result<String, String> {
 
 /// Like [`render`], with named templates that the template can `{% include "name" %}`.
 pub fn render_with(template: &str, ctx: &Context, partials: &Partials) -> Result<String, String> {
+    render_with_filters(template, ctx, partials, &NoFilters)
+}
+
+/// Like [`render_with`], with filters supplied by the caller (see [`FilterSet`]).
+pub fn render_with_filters(template: &str, ctx: &Context, partials: &Partials, filters: &dyn FilterSet) -> Result<String, String> {
     let nodes = load(template, partials, 0)?;
     let mut out = String::new();
     let mut env = Env {
         globals: ctx,
         locals: Vec::new(),
         partials,
+        custom: filters,
         depth: 0,
         includes: 0,
         iterations: 0,

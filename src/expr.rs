@@ -2,7 +2,7 @@
 
 use crate::Value;
 use crate::env::Env;
-use crate::limits::MAX_NESTING;
+use crate::limits::{CUSTOM_FILTER_COST, MAX_NESTING, MAX_VALUE_SIZE};
 use crate::filters::apply_filter;
 use crate::parse::split_top;
 use std::borrow::Cow;
@@ -50,7 +50,18 @@ pub(crate) fn output<'a>(expr: &str, env: &'a Env) -> Result<Cow<'a, Value>, Str
             split_top(args, ',').iter().map(|a| value(a, env).into_owned()).collect()
         };
         env.charge(v.weight() / 256)?;
-        v = Cow::Owned(apply_filter(name.trim(), &v, &args)?);
+        let name = name.trim();
+        v = Cow::Owned(match env.custom.call(name, &v, &args) {
+            Some(result) => {
+                env.charge(CUSTOM_FILTER_COST)?;
+                let out = result.map_err(|e| format!("Filter '{name}' failed: {e}"))?;
+                if out.weight() > MAX_VALUE_SIZE {
+                    return Err(format!("Filter '{name}' returned a value that is too large (max {MAX_VALUE_SIZE} bytes)"));
+                }
+                out
+            }
+            None => apply_filter(name, &v, &args)?,
+        });
     }
     Ok(v)
 }

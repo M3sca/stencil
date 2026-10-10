@@ -4,6 +4,10 @@
 
 #[cfg(feature = "node")]
 mod node;
+#[cfg(feature = "wasm")]
+mod wasm;
+#[cfg(any(feature = "node", feature = "wasm"))]
+mod json;
 
 mod env;
 mod expr;
@@ -19,7 +23,8 @@ mod tests;
 
 use std::collections::HashMap;
 
-pub use render::{render, render_with};
+pub use filters::FilterSet;
+pub use render::{render, render_with, render_with_filters};
 pub use value::Value;
 
 pub type Context = HashMap<String, Value>;
