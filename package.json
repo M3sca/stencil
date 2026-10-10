@@ -1,0 +1,9 @@
+{
+  "name": "stencil",
+  "version": "0.1.0",
+  "main": "stencil.node",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test"
+  }
+}
