@@ -2,6 +2,7 @@
   "name": "stencil",
   "version": "0.1.0",
   "description": "A minimal template engine written in Rust, with Node.js bindings",
+  "license": "MIT",
   "main": "index.js",
   "types": "index.d.ts",
   "napi": {

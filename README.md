@@ -105,3 +105,7 @@ npm test      # Node binding tests (after npm run build)
 
 Releases: pushing a tag like `v0.1.0` makes GitHub Actions build every platform and attach the binaries to a GitHub Release.
 ```
+
+## License
+
+[MIT](LICENSE)
