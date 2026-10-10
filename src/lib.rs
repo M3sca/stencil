@@ -24,6 +24,18 @@ impl From<Vec<Value>> for Value { fn from(v: Vec<Value>) -> Self { Value::List(v
 
 pub type Context = HashMap<String, Value>;
 
+/// Named templates available to `{% include "name" %}`. Names are plain map keys:
+/// they are never interpreted as paths and nothing here touches the filesystem.
+pub type Partials = HashMap<String, String>;
+
+const MAX_INCLUDE_DEPTH: usize = 32;
+// Bounds output growth from templates that include each other many times over.
+const MAX_INCLUDES: usize = 100_000;
+/// Total loop iterations in one render (all loops, all includes).
+const MAX_ITERATIONS: usize = 1_000_000;
+/// Maximum size of a rendered output, in bytes.
+const MAX_OUTPUT: usize = 10 * 1024 * 1024;
+
 impl Value {
     fn truthy(&self) -> bool {
         !matches!(self, Value::Nil | Value::Bool(false))
@@ -56,11 +68,15 @@ enum Tok {
     Tag(String),
 }
 
+#[derive(Clone)]
 enum Node {
     Text(String),
     Out(String),
     If(Vec<(String, Vec<Node>)>),
     For { var: String, list: String, body: Vec<Node> },
+    Include { name: String, args: Vec<(String, String)> },
+    Extends(String),
+    Block { name: String, body: Vec<Node> },
 }
 
 fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
@@ -125,12 +141,47 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str]) -> Result<(Vec<Node>, Optio
                         end.ok_or("Unclosed block: missing 'endfor'")?;
                         nodes.push(Node::For { var: var.trim().into(), list: list.trim().into(), body });
                     }
+                    "include" => nodes.push(parse_include("include", arg)?),
+                    "extends" => match parse_include("extends", arg)? {
+                        Node::Include { name, args } if args.is_empty() => nodes.push(Node::Extends(name)),
+                        _ => return Err("extends takes only a quoted template name".into()),
+                    },
+                    "block" => {
+                        if arg.is_empty() || !arg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                            return Err(format!("Invalid block name: '{arg}'"));
+                        }
+                        let (body, end) = block(toks, i, &["endblock"])?;
+                        end.ok_or("Unclosed block: missing 'endblock'")?;
+                        nodes.push(Node::Block { name: arg.into(), body });
+                    }
                     _ => return Err(format!("Unknown tag: {name}")),
                 }
             }
         }
     }
     Ok((nodes, None))
+}
+
+/// `"name"` or `"name" with a = expr, b = expr`. The name must be a quoted literal.
+fn parse_include(tag: &str, arg: &str) -> Result<Node, String> {
+    let bad = || format!("{tag} needs a quoted template name");
+    let q = arg.chars().next().filter(|c| matches!(c, '"' | '\'')).ok_or_else(bad)?;
+    let rest = &arg[1..];
+    let end = rest.find(q).filter(|&e| e > 0).ok_or_else(bad)?;
+    let tail = rest[end + 1..].trim();
+    let mut args = Vec::new();
+    if !tail.is_empty() {
+        let list = tail.strip_prefix("with").filter(|l| l.starts_with(char::is_whitespace));
+        for part in split_top(list.ok_or(format!("Invalid {tag}: {arg}"))?, ',') {
+            let (k, v) = part.split_once('=').ok_or(format!("Invalid include argument: '{}'", part.trim()))?;
+            let k = k.trim();
+            if k.is_empty() || !k.chars().all(|c| c.is_alphanumeric() || c == '_') || v.trim().is_empty() {
+                return Err(format!("Invalid include argument: '{}'", part.trim()));
+            }
+            args.push((k.to_string(), v.trim().to_string()));
+        }
+    }
+    Ok(Node::Include { name: rest[..end].to_string(), args })
 }
 
 /// Splits on `sep`, ignoring occurrences inside quotes.
@@ -152,10 +203,71 @@ fn split_top(s: &str, sep: char) -> Vec<&str> {
     parts
 }
 
+/// Collects every `block` in the tree by name; a name defined twice is an error.
+fn collect_blocks(nodes: &[Node], map: &mut HashMap<String, Vec<Node>>) -> Result<(), String> {
+    for n in nodes {
+        match n {
+            Node::Block { name, body } => {
+                if map.insert(name.clone(), body.clone()).is_some() {
+                    return Err(format!("Duplicate block '{name}'"));
+                }
+                collect_blocks(body, map)?;
+            }
+            Node::If(branches) => branches.iter().try_for_each(|(_, b)| collect_blocks(b, map))?,
+            Node::For { body, .. } => collect_blocks(body, map)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Replaces the body of every block that `ov` overrides. Blocks nested inside an overriding body are left as written.
+fn substitute(nodes: Vec<Node>, ov: &HashMap<String, Vec<Node>>) -> Vec<Node> {
+    nodes
+        .into_iter()
+        .map(|n| match n {
+            Node::Block { name, body } => {
+                let body = ov.get(&name).cloned().unwrap_or_else(|| substitute(body, ov));
+                Node::Block { name, body }
+            }
+            Node::If(branches) => Node::If(branches.into_iter().map(|(c, b)| (c, substitute(b, ov))).collect()),
+            Node::For { var, list, body } => Node::For { var, list, body: substitute(body, ov) },
+            n => n,
+        })
+        .collect()
+}
+
+/// Parses a template and resolves `{% extends %}`: the parent is loaded (recursively) and this template's blocks replace the parent's.
+// ponytail: block bodies are cloned while resolving; fine for page-sized templates.
+fn load(src: &str, partials: &Partials, depth: usize) -> Result<Vec<Node>, String> {
+    let toks = tokenize(src)?;
+    let (nodes, _) = block(&toks, &mut 0, &[])?;
+    let mut own = HashMap::new();
+    collect_blocks(&nodes, &mut own)?;
+    let Some(i) = nodes.iter().position(|n| matches!(n, Node::Extends(_))) else {
+        return Ok(nodes);
+    };
+    let first = nodes[..i].iter().all(|n| matches!(n, Node::Text(t) if t.trim().is_empty()));
+    if !first || nodes[i + 1..].iter().any(|n| matches!(n, Node::Extends(_))) {
+        return Err("extends must be the first tag of a template, and used once".into());
+    }
+    let Node::Extends(parent) = &nodes[i] else { unreachable!() };
+    if depth >= MAX_INCLUDE_DEPTH {
+        return Err(format!("Extends nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{parent}'"));
+    }
+    let psrc = partials.get(parent).ok_or(format!("Unknown template: {parent}"))?;
+    let base = load(psrc, partials, depth + 1).map_err(|e| format!("{e} (in '{parent}')"))?;
+    Ok(substitute(base, &own))
+}
+
 /// Caller context plus loop-local variables (a stack: no clone per iteration).
 struct Env<'a> {
     globals: &'a Context,
     locals: Vec<(String, Value)>,
+    partials: &'a Partials,
+    depth: usize,
+    includes: usize,
+    iterations: usize,
 }
 
 impl Env<'_> {
@@ -364,11 +476,19 @@ fn condition(expr: &str, env: &Env) -> Result<bool, String> {
     Ok(v.truthy())
 }
 
+fn emit(out: &mut String, s: &str) -> Result<(), String> {
+    if out.len() + s.len() > MAX_OUTPUT {
+        return Err(format!("Output too large (max {MAX_OUTPUT} bytes)"));
+    }
+    out.push_str(s);
+    Ok(())
+}
+
 fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
     for n in nodes {
         match n {
-            Node::Text(t) => out.push_str(t),
-            Node::Out(e) => out.push_str(&output(e, env)?.show()),
+            Node::Text(t) => emit(out, t)?,
+            Node::Out(e) => emit(out, &output(e, env)?.show())?,
             Node::If(branches) => {
                 for (c, body) in branches {
                     if condition(c, env)? {
@@ -377,6 +497,29 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
                     }
                 }
             }
+            Node::Include { name, args } => {
+                let src = env.partials.get(name).ok_or(format!("Unknown template: {name}"))?;
+                if env.depth >= MAX_INCLUDE_DEPTH {
+                    return Err(format!("Include nesting too deep (max {MAX_INCLUDE_DEPTH}) at '{name}'"));
+                }
+                env.includes += 1;
+                if env.includes > MAX_INCLUDES {
+                    return Err(format!("Too many includes (max {MAX_INCLUDES})"));
+                }
+                // ponytail: the partial is re-parsed on every include; cache parsed nodes if hot loops need it.
+                let nodes = load(src, env.partials, env.depth + 1).map_err(|e| format!("{e} (in '{name}')"))?;
+                // `with` values are evaluated in the caller's scope, then visible only inside the include.
+                let extra: Vec<_> = args.iter().map(|(k, e)| (k.clone(), value(e, env).into_owned())).collect();
+                let base = env.locals.len();
+                env.locals.extend(extra);
+                env.depth += 1;
+                let r = run(&nodes, env, out).map_err(|e| format!("{e} (in '{name}')"));
+                env.depth -= 1;
+                env.locals.truncate(base);
+                r?;
+            }
+            Node::Block { body, .. } => run(body, env, out)?,
+            Node::Extends(_) => return Err("extends must be the first tag of a template".into()),
             Node::For { var, list, body } => {
                 // ponytail: the list is cloned once per loop (so env isn't kept borrowed); use Rc if it gets costly.
                 let items = match value(list, env).into_owned() {
@@ -386,6 +529,11 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
                 };
                 let (base, len) = (env.locals.len(), items.len());
                 for (k, item) in items.into_iter().enumerate() {
+                    env.iterations += 1;
+                    if env.iterations > MAX_ITERATIONS {
+                        env.locals.truncate(base);
+                        return Err(format!("Too many loop iterations (max {MAX_ITERATIONS})"));
+                    }
                     let forloop = HashMap::from([
                         ("index".into(), Value::Num((k + 1) as f64)),
                         ("index0".into(), Value::Num(k as f64)),
@@ -406,10 +554,15 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
 }
 
 pub fn render(template: &str, ctx: &Context) -> Result<String, String> {
-    let toks = tokenize(template)?;
-    let (nodes, _) = block(&toks, &mut 0, &[])?;
+    render_with(template, ctx, &Partials::new())
+}
+
+/// Like [`render`], with named templates that the template can `{% include "name" %}`.
+pub fn render_with(template: &str, ctx: &Context, partials: &Partials) -> Result<String, String> {
+    let nodes = load(template, partials, 0)?;
     let mut out = String::new();
-    run(&nodes, &mut Env { globals: ctx, locals: Vec::new() }, &mut out)?;
+    let mut env = Env { globals: ctx, locals: Vec::new(), partials, depth: 0, includes: 0, iterations: 0 };
+    run(&nodes, &mut env, &mut out)?;
     Ok(out)
 }
 
@@ -459,6 +612,101 @@ mod tests {
         assert_eq!(render(t, &c).unwrap(), "12|3|");
         // Loop variables don't leak out of the loop.
         assert_eq!(render("{% for x in xs %}{% endfor %}[{{ x }}]", &c).unwrap(), "[]");
+    }
+
+    #[test]
+    fn includes() {
+        let partials = Partials::from([
+            ("row".to_string(), "<{{ x }}>".to_string()),
+            ("list".to_string(), "{% for x in xs %}{% include 'row' %}{% endfor %}".to_string()),
+            ("loop".to_string(), "{% include \"loop\" %}".to_string()),
+            ("bad".to_string(), "{% if %}".to_string()),
+            ("../../etc/passwd".to_string(), "should never be reached by path".to_string()),
+        ]);
+        let c = ctx(vec![("xs", vec![1.into(), 2.into()].into()), ("x", "g".into())]);
+        let r = |t: &str| render_with(t, &c, &partials);
+        assert_eq!(r("{% include \"row\" %}").unwrap(), "<g>"); // sees caller variables
+        assert_eq!(r("{% include \"list\" %}").unwrap(), "<1><2>"); // nested, loop variable visible
+        assert!(r("{% include \"nope\" %}").unwrap_err().contains("Unknown template"));
+        assert!(r("{% include \"loop\" %}").unwrap_err().contains("too deep"));
+        assert!(r("{% include row %}").unwrap_err().contains("quoted"));
+        assert!(r("{% include \"\" %}").is_err());
+        assert!(r("{% include \"bad\" %}").unwrap_err().contains("in 'bad'"));
+        // Names are only map keys: a traversal-looking name matches only an identical key.
+        assert!(r("{% include \"../Cargo.toml\" %}").unwrap_err().contains("Unknown template"));
+        // Templates that include each other many times over are cut off instead of exploding.
+        let mut chain: Partials = (0..25).map(|i| (format!("p{i}"), format!("{{% include 'p{}' %}}{{% include 'p{}' %}}", i + 1, i + 1))).collect();
+        chain.insert("p25".into(), "x".into());
+        assert!(render_with("{% include 'p0' %}", &c, &chain).unwrap_err().contains("Too many includes"));
+        // `with` passes extra variables, evaluated in the caller's scope, visible only in the include.
+        let p2 = Partials::from([("card".to_string(), "[{{ title }}|{{ n }}]".to_string())]);
+        let w = |t: &str| render_with(t, &c, &p2);
+        assert_eq!(w("{% include 'card' with title = 'A, b', n = 3 %}").unwrap(), "[A, b|3]");
+        assert_eq!(w("{% for x in xs %}{% include 'card' with title = x, n = xs.size %}{% endfor %}").unwrap(), "[1|2][2|2]");
+        assert_eq!(w("{% include 'card' with title = 'T' %}{{ title }}.").unwrap(), "[T|].");
+        for bad in ["with", "with a", "with = 1", "with a =", "with 1x y = 2", "x = 1"] {
+            assert!(w(&format!("{{% include 'card' {bad} %}}")).is_err(), "{bad}");
+        }
+        // Includes need registered partials: plain render() has none.
+        assert!(render("{% include \"row\" %}", &c).is_err());
+    }
+
+    #[test]
+    fn iterations_are_capped() {
+        let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+        let small: Vec<Value> = (0..500).map(|i| (i as i64).into()).collect();
+        let c = ctx(vec![("big", big.into()), ("small", small.into())]);
+        let t = "{% for a in big %}{% for b in big %}{% for c in big %}{% endfor %}{% endfor %}{% endfor %}";
+        assert!(render(t, &c).unwrap_err().contains("Too many loop iterations"));
+        assert_eq!(render("{% for a in small %}{% for b in small %}{% endfor %}{% endfor %}", &c).unwrap(), "");
+    }
+
+    #[test]
+    fn extends_and_blocks() {
+        let partials = Partials::from([
+            ("layout".to_string(), "<h1>{% block title %}Site{% endblock %}</h1>|{% block body %}{% endblock %}".to_string()),
+            ("section".to_string(), "{% extends 'layout' %}{% block title %}{{ title }}!{% endblock %}{% block body %}S:{% block inner %}in{% endblock %}{% endblock %}".to_string()),
+            ("rows".to_string(), "{% for x in xs %}{% block row %}-{% endblock %}{% endfor %}".to_string()),
+            ("self".to_string(), "{% extends 'self' %}".to_string()),
+            ("dup".to_string(), "{% block a %}{% endblock %}{% block a %}{% endblock %}".to_string()),
+            ("late".to_string(), "x{% extends 'layout' %}".to_string()),
+            ("with".to_string(), "{% extends 'layout' with a = 1 %}".to_string()),
+            ("page".to_string(), "{% extends 'layout' %}\n{% block body %}Hi {{ name }}{% endblock %}".to_string()),
+        ]);
+        let c = ctx(vec![("name", "Ann".into()), ("title", "T".into()), ("xs", vec![1.into(), 2.into()].into())]);
+        let r = |t: &str| render_with(t, &c, &partials);
+        // A child overrides some blocks and inherits the rest; text outside blocks is ignored.
+        assert_eq!(r("{% include 'page' %}").unwrap(), "<h1>Site</h1>|Hi Ann");
+        assert_eq!(r("{% extends 'layout' %}ignored{% block body %}B{% endblock %}").unwrap(), "<h1>Site</h1>|B");
+        // Several levels, and overriding a block nested in a parent's block.
+        assert_eq!(r("{% extends 'section' %}{% block inner %}IN2{% endblock %}").unwrap(), "<h1>T!</h1>|S:IN2");
+        assert_eq!(r("{% extends 'section' %}").unwrap(), "<h1>T!</h1>|S:in");
+        // Blocks inside loops see the loop variable.
+        assert_eq!(r("{% extends 'rows' %}{% block row %}{{ x }}{% endblock %}").unwrap(), "12");
+        // Without extends a block just renders its body; unknown blocks in a child are ignored.
+        assert_eq!(r("{% block a %}d{% endblock %}").unwrap(), "d");
+        assert_eq!(r("{% extends 'layout' %}{% block nope %}x{% endblock %}").unwrap(), "<h1>Site</h1>|");
+        // Errors.
+        assert!(r("{% extends 'nope' %}").unwrap_err().contains("Unknown template"));
+        assert!(r("{% extends 'self' %}").unwrap_err().contains("too deep"));
+        assert!(r("{% include 'dup' %}").unwrap_err().contains("Duplicate block"));
+        assert!(r("{% include 'late' %}").unwrap_err().contains("first tag"));
+        assert!(r("{% include 'with' %}").unwrap_err().contains("only a quoted"));
+        assert!(r("{% extends layout %}").unwrap_err().contains("quoted"));
+        assert!(r("{% extends 'layout' %}{% extends 'layout' %}").is_err());
+        assert!(r("{% if true %}{% extends 'layout' %}{% endif %}").is_err());
+        assert!(r("{% block %}{% endblock %}").is_err());
+        assert!(r("{% block a b %}{% endblock %}").is_err());
+        assert!(r("{% block a %}").is_err());
+    }
+
+    #[test]
+    fn output_is_capped() {
+        let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+        let c = ctx(vec![("big", big.into()), ("s", "x".repeat(100).as_str().into())]);
+        let t = "{% for a in big %}{% for b in big %}{{ s }}{% endfor %}{% endfor %}";
+        assert!(render(t, &c).unwrap_err().contains("Output too large"));
+        assert!(render("{% for a in big %}{{ s }}{% endfor %}", &c).unwrap().len() == 100_000);
     }
 
     #[test]

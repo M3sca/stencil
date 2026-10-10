@@ -19,7 +19,7 @@ let out = render(
 // "Hello ANDREA! stencil other"
 ```
 
-`render(template, &ctx)` returns `Result<String, String>`. The context is a `HashMap<String, Value>`.
+`render(template, &ctx)` returns `Result<String, String>`; `render_with(template, &ctx, &partials)` also takes named templates for `include`. The context is a `HashMap<String, Value>`.
 
 `Value` is one of `Nil`, `Bool`, `Num`, `Str`, `List` or `Map`. `From` conversions exist for `&str`, `i64`, `bool` and `Vec<Value>`.
 
@@ -87,6 +87,54 @@ Operators: `== != < > <= >= contains`, combinable with `and`, `or` and parenthes
 ```
 
 Inside a loop, `forloop` exposes `index`, `index0`, `first`, `last` and `length`. The loop variable is not visible outside the loop.
+
+### Includes
+
+```text
+{% include "header" %}
+```
+
+Renders another template, with the same variables as the caller (including loop variables). Extra variables can be passed with `with`; they are evaluated in the caller's scope and are visible only inside the include:
+
+```text
+{% include "card" with title = post.title, n = items.size %}
+```
+
+Templates are passed by name, in memory:
+
+```rust
+let partials = Partials::from([("header".to_string(), "<h1>{{ title }}</h1>".to_string())]);
+render_with("{% include \"header\" %}body", &ctx, &partials)?;
+```
+
+```js
+render('{% include "header" %}body', { title: "Hi" }, { header: "<h1>{{ title }}</h1>" });
+```
+
+Names are plain keys of that map: they are never interpreted as file paths and the engine never reads the filesystem, so path traversal (`../../etc/passwd`) is not possible. The name must be a quoted literal; it cannot be built from a variable. Nesting is limited to 32 levels (so a template that includes itself fails with an error) and a single render to 100,000 includes.
+
+### Template inheritance
+
+A layout declares blocks; a page extends it and overrides some of them:
+
+```text
+layout:                                        page:
+<h1>{% block title %}Site{% endblock %}</h1>   {% extends "layout" %}
+{% block body %}{% endblock %}                 {% block body %}Hello {{ name }}{% endblock %}
+```
+
+Rendering `page` gives the layout with its `body` replaced and `title` left as written.
+
+- `{% extends "name" %}` must be the first tag of the template, used once, and the name must be a quoted literal. The parent is looked up in the partials, like `include`.
+- Everything outside `{% block %}` in a child template is ignored.
+- Chains work (`base` → `section` → `page`); the most derived override wins. A block nested in another block can be overridden separately.
+- Blocks see the same variables as the rest of the template, including loop variables.
+- Without `extends`, a block just renders its body.
+- A block name used twice in one template is an error. A block in a child that doesn't exist in any parent is silently ignored. There is no `block.super`.
+
+## Limits
+
+To keep untrusted templates from exhausting memory or CPU, a render fails with an error once its output exceeds 10 MiB, includes/extends nest deeper than 32 levels, it performs more than 100,000 includes, or runs more than 1,000,000 loop iterations in total. These are constants at the top of `src/lib.rs`.
 
 ## Errors
 

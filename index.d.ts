@@ -9,4 +9,4 @@
  */
 export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
-export declare function render(template: string, context?: Record<string, unknown> | null): string
+export declare function render(template: string, context?: Record<string, unknown> | null, partials?: Record<string, string> | null): string
