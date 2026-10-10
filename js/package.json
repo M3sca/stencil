@@ -1,0 +1,15 @@
+{
+  "name": "stencil",
+  "version": "__VERSION__",
+  "description": "A minimal template engine written in Rust, compiled to WebAssembly",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/M3sca/stencil.git" },
+  "main": "node/index.js",
+  "types": "node/index.d.ts",
+  "exports": {
+    ".": { "types": "./node/index.d.ts", "default": "./node/index.js" },
+    "./web": { "types": "./web/index.d.ts", "default": "./web/index.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["node", "web", "README.md", "LICENSE"]
+}

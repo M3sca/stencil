@@ -1,5 +1,5 @@
-use crate::limits::{MAX_INCLUDE_DEPTH, MAX_NESTING};
-use crate::{Context, Partials, Value, render, render_with};
+use crate::limits::{MAX_INCLUDE_DEPTH, MAX_NESTING, MAX_VALUE_SIZE};
+use crate::{Context, Partials, Value, render, render_with, render_with_filters};
 use std::collections::HashMap;
 
 fn ctx(pairs: Vec<(&str, Value)>) -> Context {
@@ -420,6 +420,32 @@ fn filters_cannot_blow_up_memory() {
     let lots = ctx(vec![("lots", (0..100_000).map(|i| (i as i64).into()).collect::<Vec<Value>>().into()), ("big", (0..1000).map(|i| (i as i64).into()).collect::<Vec<Value>>().into())]);
     let e = render("{% for i in big %}{{ lots | reverse | size }}{% endfor %}", &lots).unwrap_err();
     assert!(e.contains("too complex"), "{e}");
+}
+
+#[test]
+fn host_filters() {
+    type Filter = Box<dyn Fn(&Value, &[Value]) -> Result<Value, String>>;
+    let mut filters: HashMap<String, Filter> = HashMap::new();
+    filters.insert("money".into(), Box::new(|v, args| match v {
+        Value::Num(n) => Ok(Value::Str(format!("{n:.2} {}", args.first().map_or("EUR".to_string(), Value::show)))),
+        _ => Err("money expects a number".into()),
+    }));
+    filters.insert("uppercase".into(), Box::new(|v, _| Ok(Value::Str(format!("mine:{}", v.show())))));
+    filters.insert("huge".into(), Box::new(|_, _| Ok(Value::Str("x".repeat(MAX_VALUE_SIZE + 1)))));
+    let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("big", big.into()), ("n", 5.into())]);
+    let r = |t: &str| render_with_filters(t, &c, &Partials::new(), &filters);
+    assert_eq!(r("{{ n | money }}|{{ n | money: 'USD' }}|{{ n | plus: 1 | money }}").unwrap(), "5.00 EUR|5.00 USD|6.00 EUR");
+    // Host filters are tried first, so they can replace a built-in; without them the built-in is used.
+    assert_eq!(r("{{ 'x' | uppercase }}").unwrap(), "mine:x");
+    assert_eq!(render("{{ 'x' | uppercase }}", &c).unwrap(), "X");
+    // Their errors carry the filter name and the line; unknown names still fail.
+    assert_eq!(r("a\n{{ 'x' | money }}").unwrap_err(), "Filter 'money' failed: money expects a number (line 2)");
+    assert!(r("{{ 1 | nope }}").unwrap_err().contains("Unknown filter: nope"));
+    // The same limits apply to what they return, and every call is charged.
+    assert!(r("{{ 1 | huge }}").unwrap_err().contains("too large"));
+    let calls = "{% for a in big %}{% for b in big %}{{ n | money }}{% endfor %}{% endfor %}";
+    assert!(r(calls).unwrap_err().contains("too complex"));
 }
 
 #[test]

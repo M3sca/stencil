@@ -1,26 +1,8 @@
 {
-  "name": "stencil",
-  "version": "0.2.0",
-  "description": "A minimal template engine written in Rust, with Node.js bindings",
-  "license": "MIT",
-  "main": "index.js",
-  "types": "index.d.ts",
-  "napi": {
-    "binaryName": "stencil",
-    "targets": [
-      "aarch64-apple-darwin",
-      "x86_64-apple-darwin",
-      "x86_64-unknown-linux-gnu",
-      "aarch64-unknown-linux-gnu",
-      "x86_64-pc-windows-msvc"
-    ]
-  },
+  "private": true,
   "scripts": {
-    "build": "napi build --platform --release --features node",
-    "test": "node --test"
-  },
-  "devDependencies": {
-    "@napi-rs/cli": "^3.10.8"
-  },
-  "private": true
+    "build": "node build.mjs",
+    "test": "node build.mjs && node --test",
+    "pack": "node build.mjs && npm pack ./pkg"
+  }
 }

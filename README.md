@@ -1,6 +1,6 @@
 # stencil
 
-A minimal template engine in Rust, with Node.js bindings. No dependencies in the core crate.
+A minimal template engine in Rust, compiled to WebAssembly for Node.js and browsers. The Rust crate has no dependencies.
 
 ## Usage
 
@@ -19,35 +19,77 @@ let out = render(
 // "Hello ANDREA! stencil other"
 ```
 
-`render(template, &ctx)` returns `Result<String, String>`; `render_with(template, &ctx, &partials)` also takes named templates for `include`. The context is a `HashMap<String, Value>`.
+`render(template, &ctx)` returns `Result<String, String>`. `render_with(template, &ctx, &partials)` also takes named templates for `include`/`extends`, and `render_with_filters(template, &ctx, &partials, &filters)` your own filters (see [Custom filters](#custom-filters)). The context is a `HashMap<String, Value>`.
 
 `Value` is one of `Nil`, `Bool`, `Num`, `Str`, `List` or `Map`. `From` conversions exist for `&str`, `i64`, `bool` and `Vec<Value>`.
 
-## Usage from Node.js
+## Usage from Node.js and browsers
 
-Build the native addon from source (requires Rust):
-
-```sh
-git clone https://github.com/M3sca/stencil && cd stencil
-npm install && npm run build
-```
-
-Or skip Rust: each [GitHub Release](https://github.com/M3sca/stencil/releases) has prebuilt binaries (macOS arm64/x64, Linux x64/arm64, Windows x64). Download the `.node` file for your platform into the repository folder, next to `index.js`.
-
-Then, from your project:
+The engine is compiled to WebAssembly: one package works on every OS and CPU (macOS, Linux including Alpine, Windows, Docker) with no native build and no Rust needed. Each [GitHub Release](https://github.com/M3sca/stencil/releases) has a `stencil-<version>.tgz`:
 
 ```sh
-npm install /path/to/stencil
+npm install https://github.com/M3sca/stencil/releases/download/v0.3.0/stencil-0.3.0.tgz
 ```
 
 ```js
-const { render } = require("stencil");
+import { render } from "stencil";          // or: const { render } = require("stencil");
 
 render("Hello {{ user.name | uppercase }}!", { user: { name: "Andrea" } });
 // "Hello ANDREA!"
+
+render(template, context, partials, filters); // all but the template are optional
 ```
 
-TypeScript types are included. The context is a plain JS object (values are converted as JSON: `null` becomes `nil`); errors are thrown as exceptions.
+- `context` is an object, or a JSON string you already have (this saves one `JSON.stringify`). Values are JSON: `null` becomes `nil`.
+- `partials` is an object of named templates for `include` and `extends`.
+- `filters` is an object of custom filters (below).
+- Errors are thrown as `Error`s whose message includes the template line.
+- TypeScript types are included.
+
+In a browser, or anywhere that can't load files synchronously, use the web build:
+
+```js
+import { init, render } from "stencil/web";
+
+await init();            // loads the .wasm once; or initSync({ module: bytes })
+render("Hello {{ n }}", { n: 1 });
+```
+
+Bundlers need to treat `stencil_bg.wasm` as an asset (it is loaded with `new URL(..., import.meta.url)`). In Next.js standalone builds, make sure the `.wasm` file is included in the traced files.
+
+## Custom filters
+
+Filters are supplied by your program, tried before the built-in ones (so a custom `date` replaces the built-in `date`), and called as `{{ value | name: arg1, arg2 }}`.
+
+```js
+const filters = {
+  money: (value, currency = "EUR") =>
+    new Intl.NumberFormat("it-IT", { style: "currency", currency }).format(value),
+};
+
+render("{{ price | money }} / {{ price | money: 'USD' }}", { price: 5 }, undefined, filters);
+```
+
+In Rust, implement `FilterSet`, or pass a `HashMap<String, F>` of closures:
+
+```rust
+use std::collections::HashMap;
+use stencil::{Context, Partials, Value, render_with_filters};
+
+let mut filters: HashMap<String, Box<dyn Fn(&Value, &[Value]) -> Result<Value, String>>> = HashMap::new();
+filters.insert("money".into(), Box::new(|v, _args| match v {
+    Value::Num(n) => Ok(Value::Str(format!("{n:.2} EUR"))),
+    _ => Err("money expects a number".into()),
+}));
+let out = render_with_filters("{{ 5 | money }}", &Context::new(), &Partials::new(), &filters)?;
+```
+
+Rules:
+- Filters are **synchronous**; a filter that returns a `Promise` is an error. Values are exchanged as JSON (functions, `undefined` and `NaN` become `nil`); returning `undefined` gives an empty result.
+- A filter that throws makes the render fail with `Filter 'name' failed: <message> (line N)`.
+- Templates can only call the **own** properties of the object you pass, never inherited ones such as `toString` or `constructor`.
+- The result is subject to the same size limit as any other value (16 MiB), and each call counts against the work limit.
+- Filters are trusted code that runs inside the render: a slow or non-terminating filter blocks the caller. Don't let templates choose which functions exist; you decide that.
 
 ## Syntax
 
@@ -215,13 +257,14 @@ Templates are code, so a malicious one must not be able to exhaust memory, CPU o
 | one computed value (`assign`, `capture`, filter result) | 16 MiB |
 | all values stored by `assign`/`capture` in one render | 128 MiB |
 
-These are constants at the top of `src/lib.rs`. Each partial is parsed once per render. The size of the template, the partials and the context is up to the caller.
+These are constants in `src/limits.rs`. Each partial is parsed once per render. The size of the template, the partials and the context is up to the caller.
 
 ## Security notes
 
 - **No automatic escaping.** `{{ value }}` is inserted as is. When rendering HTML with untrusted values, apply `| escape` yourself (`{{ comment | escape }}`).
 - **No filesystem access.** Included and extended templates come from the map you pass in; names are never treated as paths.
-- Templates cannot call arbitrary code: there is no way to reach anything except the values you pass in.
+- Templates cannot call arbitrary code: they can only reach the values and the custom filters you pass in.
+- The WebAssembly build runs in its own memory: a bug in the engine can't touch the host, and a panic becomes a catchable `Error` instead of ending the process.
 
 ## Errors
 
@@ -229,17 +272,20 @@ Unclosed delimiters or blocks, unknown tags and filters, empty variable names an
 
 ## Not supported
 
-Custom filters or tags registered from Rust or Node.js, time zones, and locales.
+Custom tags, asynchronous filters, time zones, and locales.
 
 ## Development
 
 ```sh
-cargo test    # Rust tests
-cargo run --example demo   # demo in examples/demo.rs
-npm test      # Node binding tests (after npm run build)
-
-Releases: pushing a tag like `v0.1.0` makes GitHub Actions build every platform and attach the binaries to a GitHub Release.
+cargo test                  # Rust tests
+cargo run --example demo    # demo in examples/demo.rs
+npm test                    # builds the WebAssembly package into ./pkg and tests it from Node
+npm run pack                # also produces stencil-<version>.tgz
 ```
+
+Building the package needs the `wasm32-unknown-unknown` target and `wasm-bindgen-cli` at the version in `Cargo.lock`; `npm run build` tells you the exact command if it is missing.
+
+Releases: pushing a tag like `v0.3.0` makes GitHub Actions test, build the package and attach `stencil-<version>.tgz` to a GitHub Release.
 
 ## License
 

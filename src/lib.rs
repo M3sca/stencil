@@ -2,12 +2,10 @@
 //! `{{ var | filter: arg }}`, `{% if/elsif/else %}`, `{% for x in xs %}`,
 //! `{% include %}`, `{% extends %}`/`{% block %}`.
 
-#[cfg(feature = "node")]
-mod node;
+#[cfg(feature = "wasm")]
+mod json;
 #[cfg(feature = "wasm")]
 mod wasm;
-#[cfg(any(feature = "node", feature = "wasm"))]
-mod json;
 
 mod env;
 mod expr;
