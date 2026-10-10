@@ -31,6 +31,16 @@ impl Value {
         }
     }
 
+    /// Approximate memory footprint in bytes; used to bound the size of computed values.
+    pub(crate) fn weight(&self) -> usize {
+        match self {
+            Value::Nil | Value::Bool(_) | Value::Num(_) => 16,
+            Value::Str(s) => 24 + s.len(),
+            Value::List(l) => 24 + l.iter().map(Value::weight).sum::<usize>(),
+            Value::Map(m) => 48 + m.iter().map(|(k, v)| 24 + k.len() + v.weight()).sum::<usize>(),
+        }
+    }
+
     pub(crate) fn len(&self) -> Option<usize> {
         match self {
             Value::Str(s) => Some(s.chars().count()),

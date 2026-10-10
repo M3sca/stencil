@@ -213,6 +213,115 @@ fn errors_have_line_numbers() {
 }
 
 #[test]
+fn whitespace_control() {
+    let c = ctx(vec![("x", "v".into()), ("xs", vec![1.into(), 2.into()].into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    // Without dashes whitespace is kept.
+    assert_eq!(r("a {% if true %} b {% endif %} c"), "a  b  c");
+    // `{%-` strips before the tag, `-%}` after it; same for `{{-` and `-}}`.
+    assert_eq!(r("a  {%- if true -%}  b  {%- endif -%}  c"), "abc");
+    assert_eq!(r("a  {{- x -}}  b"), "avb");
+    assert_eq!(r("a  {{- x }}  b"), "av  b");
+    assert_eq!(r("{% for x in xs -%}\n  {{ x }}\n{%- endfor %}"), "12");
+    assert_eq!(r("{% for x in xs %}\n{{ x }}\n{% endfor %}"), "\n1\n\n2\n");
+    assert_eq!(r("{% if true -%}x{% endif -%}  \n"), "x");
+    assert_eq!(r("a {#- c -#} b"), "ab");
+    assert_eq!(r("{%- raw -%}  {{x}}  {%- endraw -%}"), "{{x}}");
+    assert_eq!(r("{{ -1 }}"), "-1");
+    // Line numbers don't change.
+    assert_eq!(render("a\n\n{%- nope %}", &c).unwrap_err(), "Unknown tag: nope (line 3)");
+}
+
+#[test]
+fn unless_and_not() {
+    let c = ctx(vec![("a", true.into()), ("b", false.into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{% unless a %}no{% endunless %}"), "");
+    assert_eq!(r("{% unless b %}no{% endunless %}"), "no");
+    assert_eq!(r("{% unless a %}A{% else %}B{% endunless %}"), "B");
+    assert_eq!(r("{% unless missing %}M{% endunless %}"), "M");
+    assert_eq!(r("{% if not a %}y{% else %}n{% endif %}"), "n");
+    assert_eq!(r("{% if not b and a %}y{% endif %}"), "y");
+    assert_eq!(r("{% if not (a or b) %}y{% else %}n{% endif %}"), "n");
+    assert_eq!(r("{% if not not a %}y{% endif %}"), "y");
+    assert_eq!(r("{% if not a == b %}y{% endif %}"), "y");
+    assert!(render("{% unless a %}x", &c).unwrap_err().contains("endunless"));
+    assert!(render("{% unless %}x{% endunless %}", &c).is_err());
+    // A long run of `not` is refused, not a stack overflow.
+    let t = format!("{{% if {}a %}}x{{% endif %}}", "not ".repeat(100_000));
+    assert!(render(&t, &c).unwrap_err().contains("nested too deeply"));
+}
+
+#[test]
+fn case_when() {
+    let c = ctx(vec![("n", 2.into()), ("s", "b".into()), ("k", "b".into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{% case n %}{% when 1 %}one{% when 2 %}two{% else %}other{% endcase %}"), "two");
+    assert_eq!(r("{% case n %}{% when 1 %}one{% else %}other{% endcase %}"), "other");
+    assert_eq!(r("{% case n %}{% when 1 %}one{% endcase %}"), "");
+    assert_eq!(r("{% case s %}{% when 'a', 'b' %}ab{% when 'c' %}c{% endcase %}"), "ab");
+    assert_eq!(r("{% case s %}{% when k %}same{% endcase %}"), "same");
+    // Text between `case` and the first `when` is ignored; only the first match runs.
+    assert_eq!(r("{% case n %}ignored{% when 2 %}x{% when 2 %}y{% endcase %}"), "x");
+    assert_eq!(r("{% case n %}{% when 2 %}{% if true %}in{% endif %}{% endcase %}"), "in");
+    assert!(render("{% case %}{% endcase %}", &c).is_err());
+    assert!(render("{% case n %}{% when %}x{% endcase %}", &c).is_err());
+    assert!(render("{% case n %}{% when 1 %}x", &c).unwrap_err().contains("endcase"));
+}
+
+#[test]
+fn break_and_continue() {
+    let xs: Vec<Value> = (1..=3).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("xs", xs.into())]);
+    let r = |t: &str| render(t, &c);
+    assert_eq!(r("{% for x in xs %}{% if x == 3 %}{% break %}{% endif %}{{ x }}{% endfor %}").unwrap(), "12");
+    assert_eq!(r("{% for x in xs %}{% if x == 2 %}{% continue %}{% endif %}{{ x }}{% endfor %}").unwrap(), "13");
+    // Only the innermost loop stops; through case and block too.
+    let nested = "{% for a in xs %}{% for b in xs %}{% if b == 2 %}{% break %}{% endif %}{{ a }}{{ b }},{% endfor %}|{% endfor %}";
+    assert_eq!(r(nested).unwrap(), "11,|21,|31,|");
+    let case = "{% for x in xs %}{% case x %}{% when 2 %}{% continue %}{% endcase %}{{ x }}{% endfor %}";
+    assert_eq!(r(case).unwrap(), "13");
+    // Text after a break in the same body is skipped.
+    assert_eq!(r("{% for x in xs %}a{% break %}b{% endfor %}").unwrap(), "a");
+    // Errors: outside a loop, or across an include.
+    assert_eq!(r("a\n{% break %}").unwrap_err(), "break outside a loop (line 2)");
+    assert!(r("{% continue 1 %}").unwrap_err().contains("no arguments"));
+    let partials = Partials::from([("p".to_string(), "{% break %}".to_string())]);
+    let err = render_with("{% for x in xs %}{% include 'p' %}{% endfor %}", &c, &partials).unwrap_err();
+    assert!(err.contains("break outside a loop"), "{err}");
+    // The loop bookkeeping stays consistent after a break.
+    assert_eq!(r("{% for x in xs %}{% break %}{% endfor %}{% break %}").unwrap_err(), "break outside a loop (line 1)");
+}
+
+#[test]
+fn assign_and_capture() {
+    let c = ctx(vec![("x", "v".into()), ("xs", vec![1.into(), 2.into(), 3.into()].into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{% assign a = 'hi' %}{{ a }}"), "hi");
+    assert_eq!(r("{% assign n = xs.size %}{{ n }}"), "3");
+    assert_eq!(r("{% assign u = x | uppercase %}{{ u }}"), "V");
+    // Shadows a caller variable; the nearest one is updated, also from inside a loop.
+    assert_eq!(r("{% assign x = 'w' %}{{ x }}"), "w");
+    assert_eq!(r("{% assign c = 0 %}{% for i in xs %}{% assign c = i %}{% endfor %}{{ c }}"), "3");
+    // A variable created inside a loop iteration ends with it.
+    assert_eq!(r("{% for i in xs %}{% assign t = i %}{% endfor %}[{{ t }}]"), "[]");
+    assert_eq!(r("{% capture g %}Hello {{ x }}!{% endcapture %}{{ g | uppercase }}|{{ g }}"), "HELLO V!|Hello v!");
+    assert_eq!(r("{% capture list %}{% for i in xs %}{{ i }}{% endfor %}{% endcapture %}{{ list }}"), "123");
+    for bad in ["{% assign %}", "{% assign a %}", "{% assign a = %}", "{% assign 1 b = 2 %}", "{% assign a-b = 1 %}", "{% capture %}{% endcapture %}", "{% capture a b %}{% endcapture %}"] {
+        assert!(render(bad, &c).is_err(), "{bad}");
+    }
+    assert!(render("{% capture a %}x", &c).unwrap_err().contains("endcapture"));
+}
+
+#[test]
+fn stored_values_are_bounded() {
+    // 9 MB captured per iteration, stored under one name: the running total is capped, not just each value.
+    let c = ctx(vec![("s", "x".repeat(1 << 20).as_str().into()), ("xs", (0..30).map(|i| (i as i64).into()).collect::<Vec<Value>>().into())]);
+    let t = format!("{{% for i in xs %}}{{% capture c %}}{}{{% endcapture %}}{{% endfor %}}", "{{ s }}".repeat(9));
+    assert!(render(&t, &c).unwrap_err().contains("Too much data"));
+}
+
+#[test]
 fn output_is_capped() {
     let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
     let c = ctx(vec![("big", big.into()), ("s", "x".repeat(100).as_str().into())]);

@@ -16,7 +16,15 @@ pub(crate) fn collect_blocks(nodes: &[Node], map: &mut HashMap<String, Vec<Node>
                 collect_blocks(body, map)?;
             }
             Node::If(branches) => branches.iter().try_for_each(|(_, b, _)| collect_blocks(b, map))?,
-            Node::For { body, .. } => collect_blocks(body, map)?,
+            Node::For { body, .. } | Node::Capture { body, .. } => collect_blocks(body, map)?,
+            Node::Case { whens, otherwise, .. } => {
+                for (_, b) in whens {
+                    collect_blocks(b, map)?;
+                }
+                if let Some(b) = otherwise {
+                    collect_blocks(b, map)?;
+                }
+            }
             _ => {}
         }
     }
@@ -34,6 +42,12 @@ pub(crate) fn substitute(nodes: Vec<Node>, ov: &HashMap<String, Vec<Node>>) -> V
             }
             Node::If(branches) => Node::If(branches.into_iter().map(|(c, b, l)| (c, substitute(b, ov), l)).collect()),
             Node::For { var, list, body, line } => Node::For { var, list, body: substitute(body, ov), line },
+            Node::Capture { name, body, line } => Node::Capture { name, body: substitute(body, ov), line },
+            Node::Case { subject, whens, otherwise } => Node::Case {
+                subject,
+                whens: whens.into_iter().map(|(v, b)| (v, substitute(b, ov))).collect(),
+                otherwise: otherwise.map(|b| substitute(b, ov)),
+            },
             n => n,
         })
         .collect()

@@ -18,6 +18,11 @@ pub(crate) enum Node {
     Include { name: String, args: Vec<(String, String)>, line: usize },
     Extends(String, usize),
     Block { name: String, body: Vec<Node>, line: usize },
+    Assign { name: String, expr: String, line: usize },
+    Capture { name: String, body: Vec<Node>, line: usize },
+    Case { subject: String, whens: Vec<(Vec<String>, Vec<Node>)>, otherwise: Option<Vec<Node>> },
+    Break(usize),
+    Continue(usize),
 }
 
 /// Appends the template line to an error message.
@@ -41,14 +46,23 @@ pub(crate) fn next_open(s: &str) -> Option<usize> {
     None
 }
 
-/// Finds the tag `{% name %}` in `s`: returns the offset of the tag and its length.
+/// Splits the `-` whitespace-control markers off a tag body: `{%- x -%}` gives (true, "x", true).
+fn dashes(body: &str) -> (bool, &str, bool) {
+    let left = body.starts_with('-');
+    let body = if left { &body[1..] } else { body };
+    let right = body.ends_with('-');
+    (left, body[..body.len() - right as usize].trim(), right)
+}
+
+/// Finds the tag `{% name %}` in `s`: returns the offset of the tag, its length and its dash markers.
 /// Tags are split the same way `tokenize` does, so this is linear too.
-pub(crate) fn find_end_tag(s: &str, name: &str) -> Option<(usize, usize)> {
+fn find_end_tag(s: &str, name: &str) -> Option<(usize, usize, bool, bool)> {
     let mut from = 0;
     while let Some(p) = s[from..].find("{%").map(|p| p + from) {
         let e = s[p + 2..].find("%}")?;
-        if s[p + 2..p + 2 + e].trim() == name {
-            return Some((p, e + 4));
+        let (left, body, right) = dashes(&s[p + 2..p + 2 + e]);
+        if body == name {
+            return Some((p, e + 4, left, right));
         }
         from = p + 2 + e + 2;
     }
@@ -58,20 +72,29 @@ pub(crate) fn find_end_tag(s: &str, name: &str) -> Option<(usize, usize)> {
 pub(crate) fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let mut toks = Vec::new();
     let (mut rest, mut line) = (src, 1);
+    let mut trim_next = false; // the previous tag ended with `-%}`: strip the whitespace after it
     while let Some(pos) = next_open(rest) {
-        if pos > 0 {
-            toks.push(Tok::Text(rest[..pos].into()));
-            line += newlines(&rest[..pos]);
-        }
         let close = match &rest[pos..pos + 2] {
             "{{" => "}}",
             "{%" => "%}",
             _ => "#}",
         };
         let inner = &rest[pos + 2..];
-        let end = inner.find(close).ok_or_else(|| at(format!("Unclosed delimiter: missing '{close}'"), line))?;
-        let body = inner[..end].trim();
+        let end = inner.find(close).ok_or_else(|| at(format!("Unclosed delimiter: missing '{close}'"), line + newlines(&rest[..pos])))?;
+        let (left, body, right) = dashes(&inner[..end]);
+        let mut text = &rest[..pos];
+        if trim_next {
+            text = text.trim_start();
+        }
+        if left {
+            text = text.trim_end();
+        }
+        if !text.is_empty() {
+            toks.push(Tok::Text(text.into()));
+        }
+        line += newlines(&rest[..pos]);
         let mut consumed = pos + 2 + end + 2;
+        trim_next = right;
         match (close, body) {
             ("}}", _) => toks.push(Tok::Out(body.into(), line)),
             ("#}", _) => {} // inline comment
@@ -79,19 +102,28 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             ("%}", "raw" | "comment") => {
                 let end_tag = if body == "raw" { "endraw" } else { "endcomment" };
                 let after = &rest[consumed..];
-                let (len, tag) = find_end_tag(after, end_tag).ok_or_else(|| at(format!("Unclosed block: missing '{end_tag}'"), line))?;
-                if body == "raw" && len > 0 {
-                    toks.push(Tok::Text(after[..len].into()));
+                let (len, tag, eleft, eright) = find_end_tag(after, end_tag).ok_or_else(|| at(format!("Unclosed block: missing '{end_tag}'"), line))?;
+                let mut content = &after[..len];
+                if right {
+                    content = content.trim_start();
+                }
+                if eleft {
+                    content = content.trim_end();
+                }
+                if body == "raw" && !content.is_empty() {
+                    toks.push(Tok::Text(content.into()));
                 }
                 consumed += len + tag;
+                trim_next = eright;
             }
             _ => toks.push(Tok::Tag(body.into(), line)),
         }
         line += newlines(&rest[pos..consumed]);
         rest = &rest[consumed..];
     }
-    if !rest.is_empty() {
-        toks.push(Tok::Text(rest.into()));
+    let text = if trim_next { rest.trim_start() } else { rest };
+    if !text.is_empty() {
+        toks.push(Tok::Text(text.into()));
     }
     Ok(toks)
 }
@@ -146,6 +178,69 @@ pub(crate) fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) ->
                         end.ok_or_else(|| at("Unclosed block: missing 'endfor'", line))?;
                         nodes.push(Node::For { var: var.trim().into(), list: list.trim().into(), body, line });
                     }
+                    "unless" => {
+                        // `unless c` is `if not (c)`; it takes an optional `else`.
+                        let (body, end) = block(toks, i, &["else", "endunless"], depth + 1)?;
+                        let (end, _, l) = end.ok_or_else(|| at("Unclosed block: missing 'endunless'", line))?;
+                        let mut branches = vec![(format!("not ({arg})"), body, line)];
+                        if end == "else" {
+                            let (body, end) = block(toks, i, &["endunless"], depth + 1)?;
+                            end.ok_or_else(|| at("Unclosed block: missing 'endunless'", line))?;
+                            branches.push(("true".into(), body, l));
+                        }
+                        nodes.push(Node::If(branches));
+                    }
+                    "case" => {
+                        if arg.is_empty() {
+                            return Err(at("case needs a value", line));
+                        }
+                        // Anything between `case` and the first `when` is ignored.
+                        let (_, mut stop) = block(toks, i, &["when", "else", "endcase"], depth + 1)?;
+                        let (mut whens, mut otherwise) = (Vec::new(), None);
+                        loop {
+                            let (end, a, l) = stop.ok_or_else(|| at("Unclosed block: missing 'endcase'", line))?;
+                            match end.as_str() {
+                                "when" => {
+                                    if a.is_empty() {
+                                        return Err(at("when needs at least one value", l));
+                                    }
+                                    let values = split_top(&a, ',').into_iter().map(|v| v.trim().to_string()).collect();
+                                    let (body, next) = block(toks, i, &["when", "else", "endcase"], depth + 1)?;
+                                    whens.push((values, body));
+                                    stop = next;
+                                }
+                                "else" => {
+                                    let (body, next) = block(toks, i, &["endcase"], depth + 1)?;
+                                    otherwise = Some(body);
+                                    stop = next;
+                                }
+                                _ => break,
+                            }
+                        }
+                        nodes.push(Node::Case { subject: arg.into(), whens, otherwise });
+                    }
+                    "assign" => {
+                        let (name, expr) = arg.split_once('=').ok_or_else(|| at("assign needs 'name = value'", line))?;
+                        let name = name.trim();
+                        if !valid_name(name) || expr.trim().is_empty() {
+                            return Err(at(format!("Invalid assign: '{arg}'"), line));
+                        }
+                        nodes.push(Node::Assign { name: name.into(), expr: expr.trim().into(), line });
+                    }
+                    "capture" => {
+                        if !valid_name(arg) {
+                            return Err(at(format!("Invalid capture name: '{arg}'"), line));
+                        }
+                        let (body, end) = block(toks, i, &["endcapture"], depth + 1)?;
+                        end.ok_or_else(|| at("Unclosed block: missing 'endcapture'", line))?;
+                        nodes.push(Node::Capture { name: arg.into(), body, line });
+                    }
+                    "break" | "continue" => {
+                        if !arg.is_empty() {
+                            return Err(at(format!("{name} takes no arguments"), line));
+                        }
+                        nodes.push(if name == "break" { Node::Break(line) } else { Node::Continue(line) });
+                    }
                     "include" => nodes.push(parse_include("include", arg, line).map_err(|e| at(e, line))?),
                     "extends" => match parse_include("extends", arg, line).map_err(|e| at(e, line))? {
                         Node::Include { name, args, .. } if args.is_empty() => nodes.push(Node::Extends(name, line)),
@@ -165,6 +260,11 @@ pub(crate) fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) ->
         }
     }
     Ok((nodes, None))
+}
+
+/// Variable names for `assign`/`capture`: letters, digits and `_`.
+fn valid_name(n: &str) -> bool {
+    !n.is_empty() && n.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
 /// `"name"` or `"name" with a = expr, b = expr`. The name must be a quoted literal.

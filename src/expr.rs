@@ -137,7 +137,7 @@ pub(crate) fn cond_tokens(s: &str) -> Result<Vec<String>, String> {
     Ok(toks)
 }
 
-/// Grammar: or := and ("or" and)* ; and := cmp ("and" cmp)* ; cmp := atom [op atom] ; atom := "(" or ")" | value.
+/// Grammar: or := and ("or" and)* ; and := not ("and" not)* ; not := "not" not | cmp ; cmp := atom [op atom] ; atom := "(" or ")" | value.
 pub(crate) struct Cond<'a> {
     toks: Vec<String>,
     i: usize,
@@ -161,13 +161,27 @@ impl<'a> Cond<'a> {
     }
 
     fn and(&mut self) -> Result<Cow<'a, Value>, String> {
-        let mut v = self.cmp()?;
+        let mut v = self.not()?;
         while self.peek() == Some("and") {
             self.i += 1;
-            let r = self.cmp()?;
+            let r = self.not()?;
             v = Cow::Owned(Value::Bool(v.truthy() && r.truthy()));
         }
         Ok(v)
+    }
+
+    fn not(&mut self) -> Result<Cow<'a, Value>, String> {
+        if self.peek() != Some("not") {
+            return self.cmp();
+        }
+        self.i += 1;
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            return Err(format!("Condition nested too deeply (max {MAX_NESTING} levels)"));
+        }
+        let v = self.not()?;
+        self.depth -= 1;
+        Ok(Cow::Owned(Value::Bool(!v.truthy())))
     }
 
     fn cmp(&mut self) -> Result<Cow<'a, Value>, String> {

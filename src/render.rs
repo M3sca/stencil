@@ -6,8 +6,17 @@ use crate::inherit::load;
 use crate::limits::*;
 use crate::parse::{Node, at};
 use crate::{Context, Partials, Value};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// How a run of nodes ended: normally, or by `break`/`continue` on its way up to the loop.
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    Normal,
+    Break,
+    Continue,
+}
 
 fn emit(out: &mut String, s: &str) -> Result<(), String> {
     if out.len() + s.len() > MAX_OUTPUT {
@@ -17,7 +26,7 @@ fn emit(out: &mut String, s: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
+fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<Flow, String> {
     env.level += 1;
     let r = if env.level > MAX_RUN_DEPTH {
         Err(format!("Template nested too deeply (max {MAX_RUN_DEPTH} levels, includes included)"))
@@ -28,11 +37,17 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
     r
 }
 
-fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
+fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<Flow, String> {
     for n in nodes {
-        env.steps += 1;
-        if env.steps > MAX_STEPS {
-            return Err(format!("Template too complex (max {MAX_STEPS} steps)"));
+        env.charge(1)?;
+        // A nested run that ended in `break`/`continue` ends this one too, up to the loop.
+        macro_rules! nested {
+            ($body:expr) => {
+                match run($body, env, out)? {
+                    Flow::Normal => {}
+                    flow => return Ok(flow),
+                }
+            };
         }
         match n {
             Node::Text(t) => emit(out, t)?,
@@ -43,10 +58,37 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
             Node::If(branches) => {
                 for (c, body, line) in branches {
                     if condition(c, env).map_err(|e| at(e, *line))? {
-                        run(body, env, out)?;
+                        nested!(body);
                         break;
                     }
                 }
+            }
+            Node::Case { subject, whens, otherwise } => {
+                let subject = value(subject, env).into_owned();
+                let hit = whens.iter().find(|(vals, _)| vals.iter().any(|v| *value(v, env) == subject));
+                match (hit, otherwise) {
+                    (Some((_, body)), _) | (None, Some(body)) => nested!(body),
+                    (None, None) => {}
+                }
+            }
+            Node::Assign { name, expr, line } => {
+                let v = output(expr, env).map_err(|e| at(e, *line))?.into_owned();
+                env.assign(name, v).map_err(|e| at(e, *line))?;
+            }
+            Node::Capture { name, body, line } => {
+                let mut buf = String::new();
+                let flow = run(body, env, &mut buf)?;
+                env.assign(name, Value::Str(buf)).map_err(|e| at(e, *line))?;
+                if flow != Flow::Normal {
+                    return Ok(flow);
+                }
+            }
+            Node::Break(line) | Node::Continue(line) => {
+                if env.loops == 0 {
+                    let what = if matches!(n, Node::Break(_)) { "break" } else { "continue" };
+                    return Err(at(format!("{what} outside a loop"), *line));
+                }
+                return Ok(if matches!(n, Node::Break(_)) { Flow::Break } else { Flow::Continue });
             }
             Node::Include { name, args, line } => {
                 let src = env.partials.get(name).ok_or_else(|| at(format!("Unknown template: {name}"), *line))?;
@@ -70,12 +112,15 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
                 let base = env.locals.len();
                 env.locals.extend(extra);
                 env.depth += 1;
+                // `break`/`continue` can't cross the include boundary.
+                let outer_loops = std::mem::replace(&mut env.loops, 0);
                 let r = run(&nodes, env, out).map_err(|e| format!("{e} (in '{name}')"));
+                env.loops = outer_loops;
                 env.depth -= 1;
                 env.locals.truncate(base);
                 r?;
             }
-            Node::Block { body, .. } => run(body, env, out)?,
+            Node::Block { body, .. } => nested!(body),
             Node::Extends(_, line) => return Err(at("extends must be the first tag of a template", *line)),
             Node::For { var, list, body, line } => {
                 // ponytail: the list is cloned once per loop (so env isn't kept borrowed); use Rc if it gets costly.
@@ -84,14 +129,17 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
                     Value::Nil => vec![],
                     v => vec![v],
                 };
+                env.charge(items.iter().map(Value::weight).sum::<usize>() / 256)?;
                 let (base, len) = (env.locals.len(), items.len());
                 // The enclosing loop's metadata (if any) becomes `forloop.parentloop`.
                 let parent = env.locals.iter().rev().find(|(n, _)| n == "forloop").map(|(_, v)| v.clone());
+                env.loops += 1;
+                let mut result = Ok(());
                 for (k, item) in items.into_iter().enumerate() {
                     env.iterations += 1;
                     if env.iterations > MAX_ITERATIONS {
-                        env.locals.truncate(base);
-                        return Err(at(format!("Too many loop iterations (max {MAX_ITERATIONS})"), *line));
+                        result = Err(at(format!("Too many loop iterations (max {MAX_ITERATIONS})"), *line));
+                        break;
                     }
                     let mut forloop = HashMap::from([
                         ("index".into(), Value::Num((k + 1) as f64)),
@@ -107,12 +155,21 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), Stri
                     env.locals.push(("forloop".into(), Value::Map(forloop)));
                     let r = run(body, env, out);
                     env.locals.truncate(base);
-                    r?;
+                    match r {
+                        Ok(Flow::Break) => break,
+                        Ok(_) => {}
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
                 }
+                env.loops -= 1;
+                result?;
             }
         }
     }
-    Ok(())
+    Ok(Flow::Normal)
 }
 
 pub fn render(template: &str, ctx: &Context) -> Result<String, String> {
@@ -123,7 +180,19 @@ pub fn render(template: &str, ctx: &Context) -> Result<String, String> {
 pub fn render_with(template: &str, ctx: &Context, partials: &Partials) -> Result<String, String> {
     let nodes = load(template, partials, 0)?;
     let mut out = String::new();
-    let mut env = Env { globals: ctx, locals: Vec::new(), partials, depth: 0, includes: 0, iterations: 0, steps: 0, level: 0, cache: HashMap::new() };
+    let mut env = Env {
+        globals: ctx,
+        locals: Vec::new(),
+        partials,
+        depth: 0,
+        includes: 0,
+        iterations: 0,
+        steps: Cell::new(0),
+        level: 0,
+        loops: 0,
+        assigned: 0,
+        cache: HashMap::new(),
+    };
     run(&nodes, &mut env, &mut out)?;
     Ok(out)
 }

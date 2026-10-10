@@ -78,7 +78,23 @@ An undefined variable renders as an empty string. Supported literals are strings
 {% if n > 5 %}big{% elsif n == 5 %}five{% else %}small{% endif %}
 ```
 
-Operators: `== != < > <= >= contains`, combinable with `and`, `or` and parentheses. `and` binds tighter than `or`. Only `nil` and `false` are falsy.
+Operators: `== != < > <= >= contains`, combinable with `not`, `and`, `or` and parentheses. `not` binds tightest, then `and`, then `or`. Only `nil` and `false` are falsy. `not` is a reserved word in conditions.
+
+`unless` is `if not`, with an optional `else`:
+
+```text
+{% unless user.admin %}Limited access{% else %}Welcome back{% endunless %}
+```
+
+`case` compares one value against several (the first `when` that matches runs; values may be literals or variables):
+
+```text
+{% case role %}
+  {% when "admin" %}Panel
+  {% when "editor", "author" %}Editor
+  {% else %}Read only
+{% endcase %}
+```
 
 ### Loops
 
@@ -86,7 +102,31 @@ Operators: `== != < > <= >= contains`, combinable with `and`, `or` and parenthes
 {% for p in projects %}{{ forloop.index }}. {{ p }}{% endfor %}
 ```
 
+`{% break %}` leaves the innermost loop and `{% continue %}` skips to its next item. They work from inside `if`, `case` and `block` within the loop, but not across an `include`, and outside a loop they are an error.
+
 Inside a loop, `forloop` exposes `index`, `index0`, `first`, `last` and `length`. The loop variable is not visible outside the loop. In nested loops, `forloop` describes the innermost loop and `forloop.parentloop` the enclosing one (chainable: `forloop.parentloop.parentloop.index`); in the outermost loop `forloop.parentloop` is empty.
+
+### Variables
+
+```text
+{% assign total = items | size %}
+{% capture greeting %}Hello {{ user.name }}!{% endcapture %}
+{{ greeting | uppercase }} ({{ total }} items)
+```
+
+`assign` stores the value of an expression (with filters); `capture` stores the text produced by a block. Assigning to a name that already exists (your own variable or an earlier `assign`) updates it; otherwise the new variable lives until the end of the enclosing loop iteration or include.
+
+### Whitespace
+
+Tags leave their surrounding whitespace in the output. A `-` next to the delimiter strips it: `{%-` and `{{-` remove the whitespace before, `-%}` and `-}}` the whitespace after (including line breaks).
+
+```text
+{% for x in xs -%}
+  {{ x }}
+{%- endfor %}
+```
+
+Write negative number literals with a space (`{{ -1 }}`, not `{{-1}}`), since `{{-` is whitespace control.
 
 ### Comments and literal text
 
@@ -155,6 +195,8 @@ Templates are code, so a malicious one must not be able to exhaust memory, CPU o
 | includes in one render | 100,000 |
 | loop iterations in one render | 1,000,000 |
 | nodes executed in one render | 2,000,000 |
+| one computed value (`assign`, `capture`, filter result) | 16 MiB |
+| all values stored by `assign`/`capture` in one render | 128 MiB |
 
 These are constants at the top of `src/lib.rs`. Each partial is parsed once per render. The size of the template, the partials and the context is up to the caller.
 
@@ -170,7 +212,7 @@ Unclosed delimiters or blocks, unknown tags and filters, empty variable names an
 
 ## Not supported
 
-`assign`, `capture`, `unless`, `case`, whitespace control (`{%-`), `break`/`continue`.
+Defining your own filters, tags or functions from the template.
 
 ## Development
 

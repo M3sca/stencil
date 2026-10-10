@@ -14,3 +14,7 @@ pub(crate) const MAX_NESTING: usize = 50;
 pub(crate) const MAX_RUN_DEPTH: usize = 100;
 /// Maximum size of a rendered output, in bytes.
 pub(crate) const MAX_OUTPUT: usize = 10 * 1024 * 1024;
+/// Size of any single computed value (filter result, `assign`, `capture`), in bytes.
+pub(crate) const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
+/// Total size of all values stored by `assign`/`capture` in one render, in bytes.
+pub(crate) const MAX_ASSIGNED: usize = 128 * 1024 * 1024;
