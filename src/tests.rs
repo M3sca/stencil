@@ -1,0 +1,232 @@
+use crate::limits::{MAX_INCLUDE_DEPTH, MAX_NESTING};
+use crate::{Context, Partials, Value, render, render_with};
+use std::collections::HashMap;
+
+fn ctx(pairs: Vec<(&str, Value)>) -> Context {
+    pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+}
+
+#[test]
+fn variables_paths_and_filters() {
+    let user = Value::Map(HashMap::from([("name".into(), "Andrea".into())]));
+    let c = ctx(vec![("user", user), ("xs", vec![1.into(), 2.into()].into())]);
+    assert_eq!(render("Hello {{ user.name | uppercase }}!", &c).unwrap(), "Hello ANDREA!");
+    assert_eq!(render("{{ x | default: 'n/a' }}", &c).unwrap(), "n/a");
+    assert_eq!(render("{{ xs | join: ', ' }}", &c).unwrap(), "1, 2");
+    assert_eq!(render("{{ xs.size }}", &c).unwrap(), "2");
+    assert_eq!(render("{{ '<a>' | escape }}", &c).unwrap(), "&#60;a&#62;");
+}
+
+#[test]
+fn if_elsif_else() {
+    let t = "{% if n > 5 %}big{% elsif n == 5 %}five{% else %}small{% endif %}";
+    for (n, want) in [(9, "big"), (5, "five"), (1, "small")] {
+        assert_eq!(render(t, &ctx(vec![("n", n.into())])).unwrap(), want);
+    }
+    let c = ctx(vec![("a", true.into())]);
+    assert_eq!(render("{% if a and b %}y{% endif %}", &c).unwrap(), "");
+    assert_eq!(render("{% if a or b %}y{% endif %}", &c).unwrap(), "y");
+    // `and` binds tighter than `or`; parentheses override; connectives inside strings are plain text.
+    assert_eq!(render("{% if a or b and c %}y{% endif %}", &c).unwrap(), "y");
+    assert_eq!(render("{% if (a or b) and c %}y{% endif %}", &c).unwrap(), "");
+    let c = ctx(vec![("s", "x and y".into())]);
+    assert_eq!(render("{% if s == 'x and y' %}y{% endif %}", &c).unwrap(), "y");
+    assert!(render("{% if (a %}y{% endif %}", &c).is_err());
+}
+
+#[test]
+fn for_loops() {
+    let c = ctx(vec![("xs", vec!["a".into(), "b".into()].into())]);
+    assert_eq!(render("{% for x in xs %}{{ forloop.index }}={{ x }};{% endfor %}", &c).unwrap(), "1=a;2=b;");
+    let meta = "{% for x in xs %}{% if forloop.first %}[{% endif %}{{ forloop.index0 }}/{{ forloop.length }}{% if forloop.last %}]{% endif %}{% endfor %}";
+    assert_eq!(render(meta, &c).unwrap(), "[0/21/2]");
+    // `forloop` doesn't outlive its loop, and in nested loops it is the innermost one's.
+    assert_eq!(render("{% for x in xs %}{% for y in xs %}{{ forloop.index }}{% endfor %}{{ forloop.index }}{% endfor %}x{{ forloop.index }}", &c).unwrap(), "121122x");
+    // `forloop.parentloop` reaches the enclosing loops, chained for deeper nesting; the outermost has none.
+    let t = "{% for a in xs %}{% for b in xs %}{% for c in xs %}{{ forloop.parentloop.parentloop.index }}{{ forloop.parentloop.index }}{{ forloop.index }}{% if forloop.last %};{% endif %}{% endfor %}{% endfor %}{% endfor %}";
+    assert_eq!(render(t, &c).unwrap(), "111112;121122;211212;221222;");
+    assert_eq!(render("{% for a in xs %}[{{ forloop.parentloop.index }}]{% endfor %}", &c).unwrap(), "[][]");
+    let rows = vec![vec![1.into(), 2.into()].into(), vec![3.into()].into()];
+    let c = ctx(vec![("rows", rows.into())]);
+    let t = "{% for r in rows %}{% for c in r %}{{ c }}{% endfor %}|{% endfor %}";
+    assert_eq!(render(t, &c).unwrap(), "12|3|");
+    // Loop variables don't leak out of the loop.
+    assert_eq!(render("{% for x in xs %}{% endfor %}[{{ x }}]", &c).unwrap(), "[]");
+}
+
+#[test]
+fn includes() {
+    let partials = Partials::from([
+        ("row".to_string(), "<{{ x }}>".to_string()),
+        ("list".to_string(), "{% for x in xs %}{% include 'row' %}{% endfor %}".to_string()),
+        ("loop".to_string(), "{% include \"loop\" %}".to_string()),
+        ("bad".to_string(), "{% if %}".to_string()),
+        ("../../etc/passwd".to_string(), "should never be reached by path".to_string()),
+    ]);
+    let c = ctx(vec![("xs", vec![1.into(), 2.into()].into()), ("x", "g".into())]);
+    let r = |t: &str| render_with(t, &c, &partials);
+    assert_eq!(r("{% include \"row\" %}").unwrap(), "<g>"); // sees caller variables
+    assert_eq!(r("{% include \"list\" %}").unwrap(), "<1><2>"); // nested, loop variable visible
+    assert!(r("{% include \"nope\" %}").unwrap_err().contains("Unknown template"));
+    assert!(r("{% include \"loop\" %}").unwrap_err().contains("too deep"));
+    assert!(r("{% include row %}").unwrap_err().contains("quoted"));
+    assert!(r("{% include \"\" %}").is_err());
+    assert!(r("{% include \"bad\" %}").unwrap_err().contains("in 'bad'"));
+    // Names are only map keys: a traversal-looking name matches only an identical key.
+    assert!(r("{% include \"../Cargo.toml\" %}").unwrap_err().contains("Unknown template"));
+    // Templates that include each other many times over are cut off instead of exploding.
+    let mut chain: Partials = (0..25).map(|i| (format!("p{i}"), format!("{{% include 'p{}' %}}{{% include 'p{}' %}}", i + 1, i + 1))).collect();
+    chain.insert("p25".into(), "x".into());
+    assert!(render_with("{% include 'p0' %}", &c, &chain).unwrap_err().contains("Too many includes"));
+    // `with` passes extra variables, evaluated in the caller's scope, visible only in the include.
+    let p2 = Partials::from([("card".to_string(), "[{{ title }}|{{ n }}]".to_string())]);
+    let w = |t: &str| render_with(t, &c, &p2);
+    assert_eq!(w("{% include 'card' with title = 'A, b', n = 3 %}").unwrap(), "[A, b|3]");
+    assert_eq!(w("{% for x in xs %}{% include 'card' with title = x, n = xs.size %}{% endfor %}").unwrap(), "[1|2][2|2]");
+    assert_eq!(w("{% include 'card' with title = 'T' %}{{ title }}.").unwrap(), "[T|].");
+    for bad in ["with", "with a", "with = 1", "with a =", "with 1x y = 2", "x = 1"] {
+        assert!(w(&format!("{{% include 'card' {bad} %}}")).is_err(), "{bad}");
+    }
+    // Includes need registered partials: plain render() has none.
+    assert!(render("{% include \"row\" %}", &c).is_err());
+}
+
+#[test]
+fn iterations_are_capped() {
+    let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+    let small: Vec<Value> = (0..500).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("big", big.into()), ("small", small.into())]);
+    let t = "{% for a in big %}{% for b in big %}{% for c in big %}{% endfor %}{% endfor %}{% endfor %}";
+    assert!(render(t, &c).unwrap_err().contains("Too many loop iterations"));
+    assert_eq!(render("{% for a in small %}{% for b in small %}{% endfor %}{% endfor %}", &c).unwrap(), "");
+}
+
+#[test]
+fn extends_and_blocks() {
+    let partials = Partials::from([
+        ("layout".to_string(), "<h1>{% block title %}Site{% endblock %}</h1>|{% block body %}{% endblock %}".to_string()),
+        ("section".to_string(), "{% extends 'layout' %}{% block title %}{{ title }}!{% endblock %}{% block body %}S:{% block inner %}in{% endblock %}{% endblock %}".to_string()),
+        ("rows".to_string(), "{% for x in xs %}{% block row %}-{% endblock %}{% endfor %}".to_string()),
+        ("self".to_string(), "{% extends 'self' %}".to_string()),
+        ("dup".to_string(), "{% block a %}{% endblock %}{% block a %}{% endblock %}".to_string()),
+        ("late".to_string(), "x{% extends 'layout' %}".to_string()),
+        ("with".to_string(), "{% extends 'layout' with a = 1 %}".to_string()),
+        ("page".to_string(), "{% extends 'layout' %}\n{% block body %}Hi {{ name }}{% endblock %}".to_string()),
+    ]);
+    let c = ctx(vec![("name", "Ann".into()), ("title", "T".into()), ("xs", vec![1.into(), 2.into()].into())]);
+    let r = |t: &str| render_with(t, &c, &partials);
+    // A child overrides some blocks and inherits the rest; text outside blocks is ignored.
+    assert_eq!(r("{% include 'page' %}").unwrap(), "<h1>Site</h1>|Hi Ann");
+    assert_eq!(r("{% extends 'layout' %}ignored{% block body %}B{% endblock %}").unwrap(), "<h1>Site</h1>|B");
+    // Several levels, and overriding a block nested in a parent's block.
+    assert_eq!(r("{% extends 'section' %}{% block inner %}IN2{% endblock %}").unwrap(), "<h1>T!</h1>|S:IN2");
+    assert_eq!(r("{% extends 'section' %}").unwrap(), "<h1>T!</h1>|S:in");
+    // Blocks inside loops see the loop variable.
+    assert_eq!(r("{% extends 'rows' %}{% block row %}{{ x }}{% endblock %}").unwrap(), "12");
+    // Without extends a block just renders its body; unknown blocks in a child are ignored.
+    assert_eq!(r("{% block a %}d{% endblock %}").unwrap(), "d");
+    assert_eq!(r("{% extends 'layout' %}{% block nope %}x{% endblock %}").unwrap(), "<h1>Site</h1>|");
+    // Errors.
+    assert!(r("{% extends 'nope' %}").unwrap_err().contains("Unknown template"));
+    assert!(r("{% extends 'self' %}").unwrap_err().contains("too deep"));
+    assert!(r("{% include 'dup' %}").unwrap_err().contains("Duplicate block"));
+    assert!(r("{% include 'late' %}").unwrap_err().contains("first tag"));
+    assert!(r("{% include 'with' %}").unwrap_err().contains("only a quoted"));
+    assert!(r("{% extends layout %}").unwrap_err().contains("quoted"));
+    assert!(r("{% extends 'layout' %}{% extends 'layout' %}").is_err());
+    assert!(r("{% if true %}{% extends 'layout' %}{% endif %}").is_err());
+    assert!(r("{% block %}{% endblock %}").is_err());
+    assert!(r("{% block a b %}{% endblock %}").is_err());
+    assert!(r("{% block a %}").is_err());
+}
+
+#[test]
+fn hostile_templates_are_bounded() {
+    let c = Context::new();
+    // Many tags in a row: parsing must be linear (it used to be quadratic).
+    let flat = "{% for a in xs %}{% endfor %}".repeat(30_000);
+    assert_eq!(render(&flat, &c).unwrap(), "");
+    // Deep nesting is refused instead of overflowing the stack.
+    let deep = |open: &str, close: &str| format!("{}x{}", open.repeat(100_000), close.repeat(100_000));
+    for (o, cl) in [("{% if true %}", "{% endif %}"), ("{% for a in xs %}", "{% endfor %}"), ("{% block a %}", "{% endblock %}")] {
+        assert!(render(&deep(o, cl), &c).unwrap_err().contains("nested too deeply"), "{o}");
+    }
+    let parens = format!("{{% if {}true{} %}}x{{% endif %}}", "(".repeat(100_000), ")".repeat(100_000));
+    assert!(render(&parens, &c).unwrap_err().contains("nested too deeply"));
+    // Deep nesting spread over a long include chain is cut by the total depth budget, not by a stack overflow.
+    let nest = |inner: &str| format!("{}{}{}", "{% if (((true))) %}".repeat(MAX_NESTING - 1), inner, "{% endif %}".repeat(MAX_NESTING - 1));
+    let mut partials: Partials = (0..MAX_INCLUDE_DEPTH - 1).map(|i| (format!("p{i}"), nest(&format!("{{% include 'p{}' %}}", i + 1)))).collect();
+    partials.insert(format!("p{}", MAX_INCLUDE_DEPTH - 1), "x".into());
+    assert!(render_with("{% include 'p0' %}", &c, &partials).unwrap_err().contains("nested too deeply"));
+    // Ordinary nesting through ordinary includes works.
+    let mut ok: Partials = (0..8).map(|i| (format!("p{i}"), format!("{{% if true %}}{{% if true %}}{{% include 'p{}' %}}{{% endif %}}{{% endif %}}", i + 1))).collect();
+    ok.insert("p8".into(), "x".into());
+    assert_eq!(render_with("{% include 'p0' %}", &c, &ok).unwrap(), "x");
+}
+
+#[test]
+fn work_is_bounded_and_partials_are_parsed_once() {
+    let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("big", big.into())]);
+    // Lots of cheap nodes inside one big partial included in a loop: capped by total steps.
+    let partials = Partials::from([("p".to_string(), "{% if false %}{% endif %}".repeat(3000))]);
+    let err = render_with("{% for a in big %}{% include 'p' %}{% endfor %}", &c, &partials).unwrap_err();
+    assert!(err.contains("too complex"), "{err}");
+}
+
+#[test]
+fn comments_and_raw() {
+    let c = ctx(vec![("x", "v".into())]);
+    assert_eq!(render("a{# a {{ x }} comment #}b", &c).unwrap(), "ab");
+    assert_eq!(render("a{% comment %}{{ x }}{% if %}{% endcomment %}b", &c).unwrap(), "ab");
+    // Raw content is output as is, including template syntax.
+    assert_eq!(render("{% raw %}{{ x }} {% if %}{% endraw %}!{{ x }}", &c).unwrap(), "{{ x }} {% if %}!v");
+    assert_eq!(render("{% raw %}{% endraw %}x", &c).unwrap(), "x");
+    // Unclosed ones are errors, with the line where they start.
+    assert_eq!(render("a\n{% raw %}b", &c).unwrap_err(), "Unclosed block: missing 'endraw' (line 2)");
+    assert!(render("{% comment %}b", &c).unwrap_err().contains("endcomment"));
+    assert!(render("a{# b", &c).unwrap_err().contains("'#}'"));
+    // Lines keep counting through comments and raw blocks.
+    assert!(render("{# a\nb #}\n{% raw %}\n\n{% endraw %}\n{% nope %}", &c).unwrap_err().ends_with("(line 6)"));
+    // A very long run of `{%` without a closing tag stays linear.
+    assert!(render(&format!("{{% raw %}}{}", "{%".repeat(500_000)), &c).is_err());
+}
+
+#[test]
+fn errors_have_line_numbers() {
+    let c = ctx(vec![("x", "v".into())]);
+    let partials = Partials::from([("p".to_string(), "ok\n{{ x | nope }}".to_string())]);
+    let err = |t: &str| render_with(t, &c, &partials).unwrap_err();
+    assert_eq!(err("a\nb\n{% nope %}"), "Unknown tag: nope (line 3)");
+    assert_eq!(err("{{ x }}\n{{ }}"), "Variable name cannot be empty (line 2)");
+    assert_eq!(err("{% if x %}\n\n{% block %}"), "Invalid block name: '' (line 3)");
+    assert_eq!(err("{% if x %}\n\n"), "Unclosed block: missing 'endif' (line 1)");
+    assert_eq!(err("{{ x\n\n"), "Unclosed delimiter: missing '}}' (line 1)");
+    // Runtime errors: unknown filter, bad condition (the `elsif` line), unknown template.
+    assert_eq!(err("\n{{ x | nope }}"), "Unknown filter: nope (line 2)");
+    assert_eq!(err("{% if false %}\n{% elsif (x %}\n{% endif %}"), "Invalid condition: missing ')' (line 2)");
+    assert_eq!(err("a\n\n{% include 'zz' %}"), "Unknown template: zz (line 3)");
+    // Errors inside an included template point to its own line.
+    assert_eq!(err("{% include 'p' %}"), "Unknown filter: nope (line 2) (in 'p')");
+    // Multi-line tags and outputs count their newlines.
+    assert!(err("{{ x\n}}\n{% nope %}").contains("(line 3)"));
+}
+
+#[test]
+fn output_is_capped() {
+    let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("big", big.into()), ("s", "x".repeat(100).as_str().into())]);
+    let t = "{% for a in big %}{% for b in big %}{{ s }}{% endfor %}{% endfor %}";
+    assert!(render(t, &c).unwrap_err().contains("Output too large"));
+    assert!(render("{% for a in big %}{{ s }}{% endfor %}", &c).unwrap().len() == 100_000);
+}
+
+#[test]
+fn errors() {
+    let c = Context::new();
+    assert!(render("Hello {{ name", &c).is_err());
+    assert!(render("{% if a %}x", &c).is_err());
+    assert!(render("{% boh %}", &c).is_err());
+    assert!(render("{{ a | nope }}", &c).is_err());
+    assert_eq!(render("Hello {{ name }}!", &c).unwrap(), "Hello !");
+}
