@@ -7,6 +7,7 @@ mod node;
 
 mod env;
 mod expr;
+mod filters;
 mod inherit;
 mod limits;
 mod parse;

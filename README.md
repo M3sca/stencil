@@ -67,10 +67,25 @@ An undefined variable renders as an empty string. Supported literals are strings
 |--------|--------|
 | `uppercase`, `lowercase` | change case |
 | `capitalize` | first letter uppercase, rest lowercase |
-| `size` | length (0 if not applicable) |
-| `join: sep` | joins a list (default separator: space) |
-| `default: v` | `v` if the value is nil, false or an empty string |
+| `strip` | remove whitespace at both ends |
+| `append: s`, `prepend: s` | add text after / before |
+| `truncate: n` or `truncate: n, "…"` | cut to `n` characters, ellipsis included (default `...`) |
+| `replace: old, new` | replace every occurrence of `old` |
+| `split: sep` | split into a list (`split: ""` gives characters) |
+| `url_encode` | percent-encode (space becomes `%20`) |
 | `escape` | converts `& < > " '` to numeric entities |
+| `default: v` | `v` if the value is nil, false or an empty string |
+| `size` | length (0 if not applicable) |
+| `plus: n`, `minus: n`, `times: n`, `divided_by: n` | arithmetic; `nil` counts as 0, numeric strings are accepted, `divided_by` is a decimal division |
+| `round`, `round: digits`, `floor`, `ceil` | rounding (`digits` from 0 to 10) |
+| `join: sep` | joins a list (default separator: space) |
+| `first`, `last`, `reverse` | first / last item (or character), reversed list |
+| `sort`, `sort: key` | sort numbers or strings (or maps by `key`); all of one kind, stable |
+| `uniq` | remove duplicates, keeping the first of each |
+| `map: key` | the `key` of every map in a list |
+| `date`, `date: format` | format a Unix timestamp in UTC (default `%Y-%m-%d`) |
+
+`date` understands `%Y %y %m %d %e %H %I %M %S %p %j %B %b %A %a %F %T %s %%`, for years 1 to 9999. Other `%x` sequences are printed as written.
 
 ### Conditions
 
@@ -101,6 +116,8 @@ Operators: `== != < > <= >= contains`, combinable with `not`, `and`, `or` and pa
 ```text
 {% for p in projects %}{{ forloop.index }}. {{ p }}{% endfor %}
 ```
+
+The list can be filtered: `{% for p in people | sort: "age" %}`.
 
 `{% break %}` leaves the innermost loop and `{% continue %}` skips to its next item. They work from inside `if`, `case` and `block` within the loop, but not across an `include`, and outside a loop they are an error.
 
@@ -212,7 +229,7 @@ Unclosed delimiters or blocks, unknown tags and filters, empty variable names an
 
 ## Not supported
 
-Defining your own filters, tags or functions from the template.
+Custom filters or tags registered from Rust or Node.js, time zones, and locales.
 
 ## Development
 

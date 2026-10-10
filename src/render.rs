@@ -124,7 +124,7 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<Flow, St
             Node::Extends(_, line) => return Err(at("extends must be the first tag of a template", *line)),
             Node::For { var, list, body, line } => {
                 // ponytail: the list is cloned once per loop (so env isn't kept borrowed); use Rc if it gets costly.
-                let items = match value(list, env).into_owned() {
+                let items = match output(list, env).map_err(|e| at(e, *line))?.into_owned() {
                     Value::List(l) => l,
                     Value::Nil => vec![],
                     v => vec![v],

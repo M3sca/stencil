@@ -321,6 +321,107 @@ fn stored_values_are_bounded() {
     assert!(render(&t, &c).unwrap_err().contains("Too much data"));
 }
 
+fn person(name: &str, age: i64) -> Value {
+    Value::Map(HashMap::from([("name".to_string(), name.into()), ("age".to_string(), age.into())]))
+}
+
+#[test]
+fn text_filters() {
+    let c = ctx(vec![("s", "  Hello World  ".into()), ("t", "Hello World".into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("[{{ s | strip }}]"), "[Hello World]");
+    assert_eq!(r("{{ t | append: '!' }}{{ t | prepend: '>' }}"), "Hello World!>Hello World");
+    assert_eq!(r("{{ t | truncate: 8 }}|{{ t | truncate: 20 }}|{{ t | truncate: 5, '' }}|{{ t | truncate: 8, '~' }}"), "Hello...|Hello World|Hello|Hello W~");
+    assert_eq!(r("{{ t | replace: 'o', '0' }}"), "Hell0 W0rld");
+    assert_eq!(r("{{ 'a,b,c' | split: ',' | join: '-' }}"), "a-b-c");
+    assert_eq!(r("{{ 'abc' | split: '' | join: '.' }}"), "a.b.c");
+    assert_eq!(r("{{ 'a b' | url_encode }}|{{ 'é&' | url_encode }}|{{ 'x-_.~' | url_encode }}"), "a%20b|%C3%A9%26|x-_.~");
+    for (bad, msg) in [("{{ t | append }}", "needs an argument"), ("{{ t | replace: '', 'x' }}", "non-empty"), ("{{ t | truncate: -1 }}", "non-negative"), ("{{ t | split }}", "needs an argument")] {
+        assert!(render(bad, &c).unwrap_err().contains(msg), "{bad}");
+    }
+}
+
+#[test]
+fn number_filters() {
+    let c = ctx(vec![("s", "4".into())]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{{ 2 | plus: 3 }} {{ 10 | minus: 4 }} {{ 3 | times: 2.5 }} {{ 7 | divided_by: 2 }}"), "5 6 7.5 3.5");
+    assert_eq!(r("{{ missing | plus: 1 }} {{ s | plus: 1 }}"), "1 5");
+    assert_eq!(r("{{ 3.14159 | round: 2 }} {{ 2.5 | round }} {{ 2.7 | floor }} {{ 2.1 | ceil }} {{ -2.5 | round }}"), "3.14 3 2 3 -3");
+    for (bad, msg) in [("{{ 7 | divided_by: 0 }}", "Division by zero"), ("{{ 'x' | plus: 1 }}", "expects a number"), ("{{ 1 | plus: 'y' }}", "expects a number"),
+                       ("{{ 1 | round: 11 }}", "0 to 10"), ("{{ 1e308 | times: 10 }}", "out of range"), ("{{ 1 | plus }}", "needs an argument")] {
+        assert!(render(bad, &c).unwrap_err().contains(msg), "{bad}");
+    }
+}
+
+#[test]
+fn list_filters() {
+    let people = vec![person("bob", 30), person("amy", 25), person("cy", 30)];
+    let c = ctx(vec![
+        ("xs", vec![3.into(), 1.into(), 2.into()].into()),
+        ("dup", vec![1.into(), 1.into(), 2.into(), 1.into(), "1".into()].into()),
+        ("words", vec!["pear".into(), "apple".into()].into()),
+        ("people", people.into()),
+        ("mixed", vec![1.into(), "a".into()].into()),
+        ("nan", vec![Value::Num(f64::NAN), 1.into()].into()),
+    ]);
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{{ xs | sort | join: '' }} {{ xs | reverse | join: '' }} {{ xs | first }} {{ xs | last }}"), "123 213 3 2");
+    assert_eq!(r("{{ words | sort | join: ',' }} {{ 'abc' | first }}{{ 'abc' | last }}"), "apple,pear ac");
+    assert_eq!(r("{{ dup | uniq | size }} {{ dup | uniq | join: '' }}"), "3 121");
+    assert_eq!(r("{{ people | map: 'name' | join: ',' }}"), "bob,amy,cy");
+    // Sorting by a key is stable.
+    assert_eq!(r("{{ people | sort: 'age' | map: 'name' | join: ',' }}"), "amy,bob,cy");
+    assert_eq!(r("{{ people | uniq | size }} {{ missing | map: 'x' | size }} {{ xs | first }}"), "3 0 3");
+    assert_eq!(r("{{ xs | sort | map: 'x' | size }}"), "3");
+    // A loop can iterate over a filtered list.
+    assert_eq!(r("{% for p in people | sort: 'age' %}{{ p.name }}{% endfor %}|{% for x in xs | reverse %}{{ x }}{% endfor %}"), "amy,bob,cy".replace(',', "") + "|213");
+    // Variables named like float words are still variables.
+    let w = ctx(vec![("inf", 5.into()), ("nan", "n".into()), ("e", "E".into())]);
+    assert_eq!(render("{{ inf }}{{ nan }}{{ e }}{{ 1e2 }}{{ -3 }}{{ .5 }}", &w).unwrap(), "5nE100-30.5");
+    for (bad, msg) in [("{{ mixed | sort }}", "same kind"), ("{{ nan | sort }}", "same kind"), ("{{ xs | sort: 'k' }}", "list of maps"),
+                       ("{{ 5 | map: 'a' }}", "expects a list"), ("{{ xs | map }}", "needs an argument"), ("{{ people | sort }}", "same kind")] {
+        assert!(render(bad, &c).unwrap_err().contains(msg), "{bad}");
+    }
+}
+
+#[test]
+fn date_filter() {
+    let c = Context::new();
+    let r = |t: &str| render(t, &c).unwrap();
+    assert_eq!(r("{{ 0 | date }}"), "1970-01-01");
+    assert_eq!(r("{{ 1700000000 | date: '%A, %d %B %Y %H:%M:%S' }}"), "Tuesday, 14 November 2023 22:13:20");
+    assert_eq!(r("{{ 1700000000 | date: '%a %b %e %y %j %I:%M %p %F %T' }}"), "Tue Nov 14 23 318 10:13 PM 2023-11-14 22:13:20");
+    assert_eq!(r("{{ 951782400 | date: '%F %j' }}"), "2000-02-29 060"); // leap day
+    assert_eq!(r("{{ -86400 | date: '%F %A' }}"), "1969-12-31 Wednesday");
+    assert_eq!(r("{{ '86400' | date: '%s %% %Q' }}"), "86400 % %Q");
+    assert_eq!(r("{{ 253402300799 | date: '%F %T' }}"), "9999-12-31 23:59:59");
+    assert_eq!(r("{{ -62135596800 | date }}"), "0001-01-01");
+    assert!(render("{{ 253402300800 | date }}", &c).unwrap_err().contains("out of range"));
+    assert!(render("{{ 'x' | date }}", &c).is_err());
+}
+
+#[test]
+fn filters_cannot_blow_up_memory() {
+    let mib = "a".repeat(1 << 20);
+    let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+    let c = ctx(vec![("s", mib.as_str().into()), ("big", big.into())]);
+    let err = |t: &str| render(t, &c).unwrap_err();
+    // Each of these would allocate far more than the cap: refused before allocating.
+    assert!(err(&format!("{{{{ s | replace: 'a', '{}' }}}}", "b".repeat(100))).contains("too large"));
+    assert!(err(&format!("{{{{ big | join: '{}' }}}}", "-".repeat(100_000))).contains("too large"));
+    assert!(err("{% assign t = s %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}{% assign t = t | append: t %}").contains("too large"));
+    let long = ctx(vec![("s", "a".repeat(5 << 20).as_str().into())]);
+    assert!(render("{{ s | split: '' | size }}", &long).unwrap_err().contains("too large"));
+    assert!(render("{{ s | url_encode }}{{ s | url_encode }}{{ s | url_encode }}", &long).is_err());
+    // A string that doubles on every loop turn stops at the cap instead of eating memory.
+    assert!(err("{% assign s = 'xxxxxxxxxx' %}{% for i in big %}{% assign s = s | append: s %}{% endfor %}").contains("too large"));
+    // Repeating an expensive filter is charged for the data it walks.
+    let lots = ctx(vec![("lots", (0..100_000).map(|i| (i as i64).into()).collect::<Vec<Value>>().into()), ("big", (0..1000).map(|i| (i as i64).into()).collect::<Vec<Value>>().into())]);
+    let e = render("{% for i in big %}{{ lots | reverse | size }}{% endfor %}", &lots).unwrap_err();
+    assert!(e.contains("too complex"), "{e}");
+}
+
 #[test]
 fn output_is_capped() {
     let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();

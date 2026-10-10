@@ -44,3 +44,11 @@ test("forloop.parentloop in nested loops", () => {
   const t = "{% for a in xs %}{% for b in xs %}{{ forloop.parentloop.index }}.{{ forloop.index }} {% endfor %}{% endfor %}";
   assert.equal(render(t, { xs: [1, 2] }), "1.1 1.2 2.1 2.2 ");
 });
+
+test("new syntax and filters from Node", () => {
+  const ctx = { people: [{ name: "bob", age: 30 }, { name: "amy", age: 25 }] };
+  assert.equal(render("{% for p in people | sort: 'age' %}{{ p.name | capitalize }}{% unless forloop.last %}, {% endunless %}{% endfor %}", ctx), "Amy, Bob");
+  assert.equal(render("{% assign n = people | size %}{% case n %}{% when 2 %}two{% else %}other{% endcase %}", ctx), "two");
+  assert.equal(render("{{ 1700000000 | date: '%F' }} {{ 7 | divided_by: 2 }}"), "2023-11-14 3.5");
+  assert.throws(() => render("{{ 1 | divided_by: 0 }}"), /Division by zero/);
+});

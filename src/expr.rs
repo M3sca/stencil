@@ -3,6 +3,7 @@
 use crate::Value;
 use crate::env::Env;
 use crate::limits::MAX_NESTING;
+use crate::filters::apply_filter;
 use crate::parse::split_top;
 use std::borrow::Cow;
 
@@ -17,7 +18,10 @@ pub(crate) fn value<'a>(expr: &str, env: &'a Env) -> Cow<'a, Value> {
         "nil" | "" => return Cow::Owned(Value::Nil),
         _ => {}
     }
-    if let Ok(n) = e.parse::<f64>() {
+    // Digits only: `parse` would also accept the words `nan` and `inf`, hiding variables with those names.
+    if e.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+        && let Ok(n) = e.parse::<f64>()
+    {
         return Cow::Owned(Value::Num(n));
     }
     let mut parts = e.split('.');
@@ -35,39 +39,6 @@ pub(crate) fn value<'a>(expr: &str, env: &'a Env) -> Cow<'a, Value> {
     cur
 }
 
-pub(crate) fn apply_filter(name: &str, v: &Value, args: &[Value]) -> Result<Value, String> {
-    let s = || v.show();
-    Ok(match name {
-        "uppercase" => Value::Str(s().to_uppercase()),
-        "lowercase" => Value::Str(s().to_lowercase()),
-        "capitalize" => {
-            let s = s().to_lowercase();
-            let mut c = s.chars();
-            Value::Str(c.next().map(|f| f.to_uppercase().chain(c).collect()).unwrap_or_default())
-        }
-        "size" => Value::Num(v.len().unwrap_or(0) as f64),
-        "join" => {
-            let sep = args.first().map(Value::show).unwrap_or(" ".into());
-            match v {
-                Value::List(l) => Value::Str(l.iter().map(Value::show).collect::<Vec<_>>().join(&sep)),
-                _ => v.clone(),
-            }
-        }
-        "default" => {
-            if v.truthy() && *v != Value::Str(String::new()) { v.clone() } else { args.first().cloned().unwrap_or(Value::Nil) }
-        }
-        "escape" => Value::Str(
-            s().chars()
-                .map(|c| match c {
-                    '&' | '<' | '>' | '"' | '\'' => format!("&#{};", c as u32),
-                    c => c.to_string(),
-                })
-                .collect(),
-        ),
-        _ => return Err(format!("Unknown filter: {name}")),
-    })
-}
-
 pub(crate) fn output<'a>(expr: &str, env: &'a Env) -> Result<Cow<'a, Value>, String> {
     let mut pipes = split_top(expr, '|').into_iter();
     let mut v = value(pipes.next().unwrap(), env);
@@ -78,6 +49,7 @@ pub(crate) fn output<'a>(expr: &str, env: &'a Env) -> Result<Cow<'a, Value>, Str
         } else {
             split_top(args, ',').iter().map(|a| value(a, env).into_owned()).collect()
         };
+        env.charge(v.weight() / 256)?;
         v = Cow::Owned(apply_filter(name.trim(), &v, &args)?);
     }
     Ok(v)
