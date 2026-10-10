@@ -86,7 +86,7 @@ Operators: `== != < > <= >= contains`, combinable with `and`, `or` and parenthes
 {% for p in projects %}{{ forloop.index }}. {{ p }}{% endfor %}
 ```
 
-Inside a loop, `forloop` exposes `index`, `index0`, `first`, `last` and `length`. The loop variable is not visible outside the loop.
+Inside a loop, `forloop` exposes `index`, `index0`, `first`, `last` and `length`. The loop variable is not visible outside the loop. In nested loops, `forloop` describes the innermost loop and `forloop.parentloop` the enclosing one (chainable: `forloop.parentloop.parentloop.index`); in the outermost loop `forloop.parentloop` is empty.
 
 ### Includes
 

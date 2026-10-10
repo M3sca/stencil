@@ -528,19 +528,24 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
                     v => vec![v],
                 };
                 let (base, len) = (env.locals.len(), items.len());
+                // The enclosing loop's metadata (if any) becomes `forloop.parentloop`.
+                let parent = env.locals.iter().rev().find(|(n, _)| n == "forloop").map(|(_, v)| v.clone());
                 for (k, item) in items.into_iter().enumerate() {
                     env.iterations += 1;
                     if env.iterations > MAX_ITERATIONS {
                         env.locals.truncate(base);
                         return Err(format!("Too many loop iterations (max {MAX_ITERATIONS})"));
                     }
-                    let forloop = HashMap::from([
+                    let mut forloop = HashMap::from([
                         ("index".into(), Value::Num((k + 1) as f64)),
                         ("index0".into(), Value::Num(k as f64)),
                         ("first".into(), Value::Bool(k == 0)),
                         ("last".into(), Value::Bool(k + 1 == len)),
                         ("length".into(), Value::Num(len as f64)),
                     ]);
+                    if let Some(p) = &parent {
+                        forloop.insert("parentloop".into(), p.clone());
+                    }
                     env.locals.push((var.clone(), item));
                     env.locals.push(("forloop".into(), Value::Map(forloop)));
                     let r = run(body, env, out);
@@ -606,6 +611,14 @@ mod tests {
     fn for_loops() {
         let c = ctx(vec![("xs", vec!["a".into(), "b".into()].into())]);
         assert_eq!(render("{% for x in xs %}{{ forloop.index }}={{ x }};{% endfor %}", &c).unwrap(), "1=a;2=b;");
+        let meta = "{% for x in xs %}{% if forloop.first %}[{% endif %}{{ forloop.index0 }}/{{ forloop.length }}{% if forloop.last %}]{% endif %}{% endfor %}";
+        assert_eq!(render(meta, &c).unwrap(), "[0/21/2]");
+        // `forloop` doesn't outlive its loop, and in nested loops it is the innermost one's.
+        assert_eq!(render("{% for x in xs %}{% for y in xs %}{{ forloop.index }}{% endfor %}{{ forloop.index }}{% endfor %}x{{ forloop.index }}", &c).unwrap(), "121122x");
+        // `forloop.parentloop` reaches the enclosing loops, chained for deeper nesting; the outermost has none.
+        let t = "{% for a in xs %}{% for b in xs %}{% for c in xs %}{{ forloop.parentloop.parentloop.index }}{{ forloop.parentloop.index }}{{ forloop.index }}{% if forloop.last %};{% endif %}{% endfor %}{% endfor %}{% endfor %}";
+        assert_eq!(render(t, &c).unwrap(), "111112;121122;211212;221222;");
+        assert_eq!(render("{% for a in xs %}[{{ forloop.parentloop.index }}]{% endfor %}", &c).unwrap(), "[][]");
         let rows = vec![vec![1.into(), 2.into()].into(), vec![3.into()].into()];
         let c = ctx(vec![("rows", rows.into())]);
         let t = "{% for r in rows %}{% for c in r %}{{ c }}{% endfor %}|{% endfor %}";

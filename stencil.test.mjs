@@ -39,3 +39,8 @@ test("extends and blocks", () => {
   const big = Array.from({ length: 1000 }, (_, i) => i);
   assert.throws(() => render("{% for a in big %}{% for b in big %}{% for c in big %}{% endfor %}{% endfor %}{% endfor %}", { big }), /Too many loop iterations/);
 });
+
+test("forloop.parentloop in nested loops", () => {
+  const t = "{% for a in xs %}{% for b in xs %}{{ forloop.parentloop.index }}.{{ forloop.index }} {% endfor %}{% endfor %}";
+  assert.equal(render(t, { xs: [1, 2] }), "1.1 1.2 2.1 2.2 ");
+});
