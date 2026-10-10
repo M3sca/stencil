@@ -1,2 +1,4 @@
 /target
-/stencil.node
+/node_modules
+*.node
+/npm

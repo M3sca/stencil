@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 
-const { render } = createRequire(import.meta.url)("./stencil.node");
+const { render } = createRequire(import.meta.url)("./index.js");
 
 test("render from Node", () => {
   const ctx = { user: { name: "Andrea" }, xs: [1, 2, 3], n: 7 };

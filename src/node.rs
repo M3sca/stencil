@@ -14,7 +14,7 @@ fn convert(v: serde_json::Value) -> Value {
     }
 }
 
-#[napi]
+#[napi(ts_args_type = "template: string, context?: Record<string, unknown> | null")]
 pub fn render(template: String, context: Option<serde_json::Value>) -> napi::Result<String> {
     let ctx: Context = match context.map(convert) {
         Some(Value::Map(m)) => m,

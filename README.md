@@ -25,20 +25,29 @@ let out = render(
 
 ## Usage from Node.js
 
-The engine builds as a native addon ([napi-rs](https://napi.rs)) behind the `node` feature:
+Build the native addon from source (requires Rust):
 
 ```sh
-npm run build   # produces stencil.node
+git clone https://github.com/M3sca/stencil && cd stencil
+npm install && npm run build
+```
+
+Or skip Rust: each [GitHub Release](https://github.com/M3sca/stencil/releases) has prebuilt binaries (macOS arm64/x64, Linux x64/arm64, Windows x64). Download the `.node` file for your platform into the repository folder, next to `index.js`.
+
+Then, from your project:
+
+```sh
+npm install /path/to/stencil
 ```
 
 ```js
-const { render } = require("./stencil.node");
+const { render } = require("stencil");
 
 render("Hello {{ user.name | uppercase }}!", { user: { name: "Andrea" } });
 // "Hello ANDREA!"
 ```
 
-The context is a plain JS object (values are converted as JSON: `null` becomes `nil`). Errors are thrown as exceptions. The addon is built for the current platform only.
+TypeScript types are included. The context is a plain JS object (values are converted as JSON: `null` becomes `nil`); errors are thrown as exceptions.
 
 ## Syntax
 
@@ -91,6 +100,8 @@ Unclosed delimiters or blocks, unknown tags and filters, empty variable names an
 
 ```sh
 cargo test    # Rust tests
-cargo run     # demo in src/main.rs
+cargo run --example demo   # demo in examples/demo.rs
 npm test      # Node binding tests (after npm run build)
+
+Releases: pushing a tag like `v0.1.0` makes GitHub Actions build every platform and attach the binaries to a GitHub Release.
 ```
