@@ -6,6 +6,7 @@ mod node;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -33,6 +34,12 @@ const MAX_INCLUDE_DEPTH: usize = 32;
 const MAX_INCLUDES: usize = 100_000;
 /// Total loop iterations in one render (all loops, all includes).
 const MAX_ITERATIONS: usize = 1_000_000;
+/// Nodes executed in one render: bounds CPU however the work is spread over loops and includes.
+const MAX_STEPS: usize = 2_000_000;
+/// Nesting of blocks (`if`/`for`/`block`) and of parentheses in conditions; bounds recursion depth.
+const MAX_NESTING: usize = 50;
+/// Total nested `run` calls across blocks, includes and loops: bounds stack use for any template.
+const MAX_RUN_DEPTH: usize = 100;
 /// Maximum size of a rendered output, in bytes.
 const MAX_OUTPUT: usize = 10 * 1024 * 1024;
 
@@ -79,10 +86,22 @@ enum Node {
     Block { name: String, body: Vec<Node> },
 }
 
+/// Position of the next `{{` or `{%`, in one pass (searching for each separately is quadratic).
+fn next_open(s: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(p) = s[from..].find('{').map(|p| p + from) {
+        if matches!(s.as_bytes().get(p + 1), Some(b'{' | b'%')) {
+            return Some(p);
+        }
+        from = p + 1;
+    }
+    None
+}
+
 fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
     let mut toks = Vec::new();
     let mut rest = src;
-    while let Some(pos) = [rest.find("{{"), rest.find("{%")].into_iter().flatten().min() {
+    while let Some(pos) = next_open(rest) {
         if pos > 0 {
             toks.push(Tok::Text(rest[..pos].into()));
         }
@@ -100,7 +119,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
 }
 
 /// Reads nodes until one of the tags in `stop`; returns the tag that ended the block.
-fn block(toks: &[Tok], i: &mut usize, stop: &[&str]) -> Result<(Vec<Node>, Option<(String, String)>), String> {
+fn block(toks: &[Tok], i: &mut usize, stop: &[&str], depth: usize) -> Result<(Vec<Node>, Option<(String, String)>), String> {
+    if depth > MAX_NESTING {
+        return Err(format!("Template nested too deeply (max {MAX_NESTING} levels)"));
+    }
     let mut nodes = Vec::new();
     while *i < toks.len() {
         let tok = &toks[*i];
@@ -124,7 +146,7 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str]) -> Result<(Vec<Node>, Optio
                         let mut branches = Vec::new();
                         let mut cond = arg.to_string();
                         loop {
-                            let (body, end) = block(toks, i, &["elsif", "else", "endif"])?;
+                            let (body, end) = block(toks, i, &["elsif", "else", "endif"], depth + 1)?;
                             branches.push((cond, body));
                             let (end, a) = end.ok_or("Unclosed block: missing 'endif'")?;
                             match end.as_str() {
@@ -137,7 +159,7 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str]) -> Result<(Vec<Node>, Optio
                     }
                     "for" => {
                         let (var, list) = arg.split_once(" in ").ok_or(format!("Invalid for tag: {tag}"))?;
-                        let (body, end) = block(toks, i, &["endfor"])?;
+                        let (body, end) = block(toks, i, &["endfor"], depth + 1)?;
                         end.ok_or("Unclosed block: missing 'endfor'")?;
                         nodes.push(Node::For { var: var.trim().into(), list: list.trim().into(), body });
                     }
@@ -150,7 +172,7 @@ fn block(toks: &[Tok], i: &mut usize, stop: &[&str]) -> Result<(Vec<Node>, Optio
                         if arg.is_empty() || !arg.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
                             return Err(format!("Invalid block name: '{arg}'"));
                         }
-                        let (body, end) = block(toks, i, &["endblock"])?;
+                        let (body, end) = block(toks, i, &["endblock"], depth + 1)?;
                         end.ok_or("Unclosed block: missing 'endblock'")?;
                         nodes.push(Node::Block { name: arg.into(), body });
                     }
@@ -241,7 +263,7 @@ fn substitute(nodes: Vec<Node>, ov: &HashMap<String, Vec<Node>>) -> Vec<Node> {
 // ponytail: block bodies are cloned while resolving; fine for page-sized templates.
 fn load(src: &str, partials: &Partials, depth: usize) -> Result<Vec<Node>, String> {
     let toks = tokenize(src)?;
-    let (nodes, _) = block(&toks, &mut 0, &[])?;
+    let (nodes, _) = block(&toks, &mut 0, &[], 0)?;
     let mut own = HashMap::new();
     collect_blocks(&nodes, &mut own)?;
     let Some(i) = nodes.iter().position(|n| matches!(n, Node::Extends(_))) else {
@@ -268,6 +290,10 @@ struct Env<'a> {
     depth: usize,
     includes: usize,
     iterations: usize,
+    steps: usize,
+    level: usize,
+    /// Parsed partials by name: each is parsed once per render, however often it is included.
+    cache: HashMap<String, Rc<Vec<Node>>>,
 }
 
 impl Env<'_> {
@@ -411,6 +437,7 @@ fn cond_tokens(s: &str) -> Result<Vec<String>, String> {
 struct Cond<'a> {
     toks: Vec<String>,
     i: usize,
+    depth: usize,
     env: &'a Env<'a>,
 }
 
@@ -456,7 +483,12 @@ impl<'a> Cond<'a> {
         let t = self.toks.get(self.i).ok_or("Incomplete condition")?.clone();
         self.i += 1;
         if t == "(" {
+            self.depth += 1;
+            if self.depth > MAX_NESTING {
+                return Err(format!("Condition nested too deeply (max {MAX_NESTING} levels)"));
+            }
             let v = self.or()?;
+            self.depth -= 1;
             if self.peek() != Some(")") {
                 return Err("Invalid condition: missing ')'".into());
             }
@@ -468,7 +500,7 @@ impl<'a> Cond<'a> {
 }
 
 fn condition(expr: &str, env: &Env) -> Result<bool, String> {
-    let mut c = Cond { toks: cond_tokens(expr)?, i: 0, env };
+    let mut c = Cond { toks: cond_tokens(expr)?, i: 0, depth: 0, env };
     let v = c.or()?;
     if c.i < c.toks.len() {
         return Err(format!("Invalid condition: '{expr}'"));
@@ -485,7 +517,22 @@ fn emit(out: &mut String, s: &str) -> Result<(), String> {
 }
 
 fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
+    env.level += 1;
+    let r = if env.level > MAX_RUN_DEPTH {
+        Err(format!("Template nested too deeply (max {MAX_RUN_DEPTH} levels, includes included)"))
+    } else {
+        run_nodes(nodes, env, out)
+    };
+    env.level -= 1;
+    r
+}
+
+fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
     for n in nodes {
+        env.steps += 1;
+        if env.steps > MAX_STEPS {
+            return Err(format!("Template too complex (max {MAX_STEPS} steps)"));
+        }
         match n {
             Node::Text(t) => emit(out, t)?,
             Node::Out(e) => emit(out, &output(e, env)?.show())?,
@@ -506,8 +553,14 @@ fn run(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<(), String> {
                 if env.includes > MAX_INCLUDES {
                     return Err(format!("Too many includes (max {MAX_INCLUDES})"));
                 }
-                // ponytail: the partial is re-parsed on every include; cache parsed nodes if hot loops need it.
-                let nodes = load(src, env.partials, env.depth + 1).map_err(|e| format!("{e} (in '{name}')"))?;
+                let nodes = match env.cache.get(name) {
+                    Some(n) => n.clone(),
+                    None => {
+                        let n = Rc::new(load(src, env.partials, env.depth + 1).map_err(|e| format!("{e} (in '{name}')"))?);
+                        env.cache.insert(name.clone(), n.clone());
+                        n
+                    }
+                };
                 // `with` values are evaluated in the caller's scope, then visible only inside the include.
                 let extra: Vec<_> = args.iter().map(|(k, e)| (k.clone(), value(e, env).into_owned())).collect();
                 let base = env.locals.len();
@@ -566,7 +619,7 @@ pub fn render(template: &str, ctx: &Context) -> Result<String, String> {
 pub fn render_with(template: &str, ctx: &Context, partials: &Partials) -> Result<String, String> {
     let nodes = load(template, partials, 0)?;
     let mut out = String::new();
-    let mut env = Env { globals: ctx, locals: Vec::new(), partials, depth: 0, includes: 0, iterations: 0 };
+    let mut env = Env { globals: ctx, locals: Vec::new(), partials, depth: 0, includes: 0, iterations: 0, steps: 0, level: 0, cache: HashMap::new() };
     run(&nodes, &mut env, &mut out)?;
     Ok(out)
 }
@@ -711,6 +764,40 @@ mod tests {
         assert!(r("{% block %}{% endblock %}").is_err());
         assert!(r("{% block a b %}{% endblock %}").is_err());
         assert!(r("{% block a %}").is_err());
+    }
+
+    #[test]
+    fn hostile_templates_are_bounded() {
+        let c = Context::new();
+        // Many tags in a row: parsing must be linear (it used to be quadratic).
+        let flat = "{% for a in xs %}{% endfor %}".repeat(30_000);
+        assert_eq!(render(&flat, &c).unwrap(), "");
+        // Deep nesting is refused instead of overflowing the stack.
+        let deep = |open: &str, close: &str| format!("{}x{}", open.repeat(100_000), close.repeat(100_000));
+        for (o, cl) in [("{% if true %}", "{% endif %}"), ("{% for a in xs %}", "{% endfor %}"), ("{% block a %}", "{% endblock %}")] {
+            assert!(render(&deep(o, cl), &c).unwrap_err().contains("nested too deeply"), "{o}");
+        }
+        let parens = format!("{{% if {}true{} %}}x{{% endif %}}", "(".repeat(100_000), ")".repeat(100_000));
+        assert!(render(&parens, &c).unwrap_err().contains("nested too deeply"));
+        // Deep nesting spread over a long include chain is cut by the total depth budget, not by a stack overflow.
+        let nest = |inner: &str| format!("{}{}{}", "{% if (((true))) %}".repeat(MAX_NESTING - 1), inner, "{% endif %}".repeat(MAX_NESTING - 1));
+        let mut partials: Partials = (0..MAX_INCLUDE_DEPTH - 1).map(|i| (format!("p{i}"), nest(&format!("{{% include 'p{}' %}}", i + 1)))).collect();
+        partials.insert(format!("p{}", MAX_INCLUDE_DEPTH - 1), "x".into());
+        assert!(render_with("{% include 'p0' %}", &c, &partials).unwrap_err().contains("nested too deeply"));
+        // Ordinary nesting through ordinary includes works.
+        let mut ok: Partials = (0..8).map(|i| (format!("p{i}"), format!("{{% if true %}}{{% if true %}}{{% include 'p{}' %}}{{% endif %}}{{% endif %}}", i + 1))).collect();
+        ok.insert("p8".into(), "x".into());
+        assert_eq!(render_with("{% include 'p0' %}", &c, &ok).unwrap(), "x");
+    }
+
+    #[test]
+    fn work_is_bounded_and_partials_are_parsed_once() {
+        let big: Vec<Value> = (0..1000).map(|i| (i as i64).into()).collect();
+        let c = ctx(vec![("big", big.into())]);
+        // Lots of cheap nodes inside one big partial included in a loop: capped by total steps.
+        let partials = Partials::from([("p".to_string(), "{% if false %}{% endif %}".repeat(3000))]);
+        let err = render_with("{% for a in big %}{% include 'p' %}{% endfor %}", &c, &partials).unwrap_err();
+        assert!(err.contains("too complex"), "{err}");
     }
 
     #[test]

@@ -134,7 +134,25 @@ Rendering `page` gives the layout with its `body` replaced and `title` left as w
 
 ## Limits
 
-To keep untrusted templates from exhausting memory or CPU, a render fails with an error once its output exceeds 10 MiB, includes/extends nest deeper than 32 levels, it performs more than 100,000 includes, or runs more than 1,000,000 loop iterations in total. These are constants at the top of `src/lib.rs`.
+Templates are code, so a malicious one must not be able to exhaust memory, CPU or the stack. A render fails with an error when:
+
+| Limit | Value |
+|-------|-------|
+| rendered output | 10 MiB |
+| nested `if`/`for`/`block` in one template, and nested parentheses in a condition | 50 levels |
+| total nested rendering depth (blocks, loops and includes together) | 100 levels |
+| include/extends chain | 32 levels |
+| includes in one render | 100,000 |
+| loop iterations in one render | 1,000,000 |
+| nodes executed in one render | 2,000,000 |
+
+These are constants at the top of `src/lib.rs`. Each partial is parsed once per render. The size of the template, the partials and the context is up to the caller.
+
+## Security notes
+
+- **No automatic escaping.** `{{ value }}` is inserted as is. When rendering HTML with untrusted values, apply `| escape` yourself (`{{ comment | escape }}`).
+- **No filesystem access.** Included and extended templates come from the map you pass in; names are never treated as paths.
+- Templates cannot call arbitrary code: there is no way to reach anything except the values you pass in.
 
 ## Errors
 
