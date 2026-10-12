@@ -19,7 +19,7 @@ let out = render(
 // "Hello ANDREA! stencil other"
 ```
 
-`render(template, &ctx)` returns `Result<String, String>`. `render_with(template, &ctx, &partials)` also takes named templates for `include`/`extends`, and `render_with_filters(template, &ctx, &partials, &filters)` your own filters (see [Custom filters](#custom-filters)). The context is a `HashMap<String, Value>`.
+`render(template, &ctx)` returns `Result<String, String>`. `render_with(template, &ctx, &partials)` also takes named templates for `include`/`extends`, and `render_with_filters(template, &ctx, &partials, &filters)` your own filters and functions (see [Custom filters](#custom-filters)). The context is a `HashMap<String, Value>`.
 
 `Value` is one of `Nil`, `Bool`, `Num`, `Str`, `List` or `Map`. `From` conversions exist for `&str`, `i64`, `bool` and `Vec<Value>`.
 
@@ -37,12 +37,12 @@ import { render } from "stencil";          // or: const { render } = require("st
 render("Hello {{ user.name | uppercase }}!", { user: { name: "Andrea" } });
 // "Hello ANDREA!"
 
-render(template, context, partials, filters); // all but the template are optional
+render(template, context, partials, filters, functions); // all but the template are optional
 ```
 
 - `context` is an object, or a JSON string you already have (this saves one `JSON.stringify`). Values are JSON: `null` becomes `nil`.
 - `partials` is an object of named templates for `include` and `extends`.
-- `filters` is an object of custom filters (below).
+- `filters` is an object of custom filters and `functions` one of custom functions (below).
 - Errors are thrown as `Error`s whose message includes the template line.
 - TypeScript types are included.
 
@@ -90,6 +90,18 @@ Rules:
 - Templates can only call the **own** properties of the object you pass, never inherited ones such as `toString` or `constructor`.
 - The result is subject to the same size limit as any other value (16 MiB), and each call counts against the work limit.
 - Filters are trusted code that runs inside the render: a slow or non-terminating filter blocks the caller. Don't let templates choose which functions exist; you decide that.
+
+### Custom functions
+
+Functions are supplied the same way, as a fifth argument, and called as `{{ name(arg1, arg2) }}`. Arguments are expressions (variables, literals, other calls, filters), and calls work anywhere a value does: output, `assign`, `if`, `case`, `include ... with`.
+
+```js
+const functions = { year: () => new Date().getFullYear(), add: (a, b) => a + b };
+
+render("© {{ year() }} / {{ add(price, 1) | round: 2 }}", { price: 5 }, undefined, undefined, functions);
+```
+
+In Rust, override `FilterSet::function` (the `HashMap` impl has no functions). The filter rules above apply, with `Function 'name' failed: ...` for errors; calls can nest up to 20 levels. An unknown name is `Unknown function: name`.
 
 ## Syntax
 

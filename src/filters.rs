@@ -55,6 +55,11 @@ fn count(args: &[Value], i: usize, filter: &str) -> Result<usize, String> {
 /// the same size limits as any other value. A `HashMap<String, F>` of closures is a `FilterSet`.
 pub trait FilterSet {
     fn call(&self, name: &str, value: &Value, args: &[Value]) -> Option<Result<Value, String>>;
+
+    /// Functions, called as `{{ name(arg1, arg2) }}`. Same rules as `call`; there are no built-in functions.
+    fn function(&self, _name: &str, _args: &[Value]) -> Option<Result<Value, String>> {
+        None
+    }
 }
 
 impl<F: Fn(&Value, &[Value]) -> Result<Value, String>> FilterSet for std::collections::HashMap<String, F> {

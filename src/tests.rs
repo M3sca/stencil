@@ -466,3 +466,17 @@ fn errors() {
     assert!(render("{{ a | nope }}", &c).is_err());
     assert_eq!(render("Hello {{ name }}!", &c).unwrap(), "Hello !");
 }
+
+#[test]
+fn host_functions() {
+    struct F;
+    impl crate::FilterSet for F {
+        fn call(&self, _: &str, _: &Value, _: &[Value]) -> Option<Result<Value, String>> { None }
+        fn function(&self, name: &str, args: &[Value]) -> Option<Result<Value, String>> {
+            (name == "sum").then(|| Ok(Value::Num(args.iter().fold(0.0, |t, a| if let Value::Num(n) = a { t + n } else { t }))))
+        }
+    }
+    let r = |t| crate::render_with_filters(t, &Context::new(), &Partials::new(), &F);
+    assert_eq!(r("{{ sum(1, sum(2, 3)) }}|{{ sum() }}|{% if sum(1) == 1 %}y{% endif %}").unwrap(), "6|0|y");
+    assert!(r("{{ nope(1) }}").unwrap_err().starts_with("Unknown function: nope"));
+}

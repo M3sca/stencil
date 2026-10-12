@@ -17,6 +17,8 @@ pub(crate) struct Env<'a> {
     pub(crate) iterations: usize,
     pub(crate) steps: Cell<usize>,
     pub(crate) level: usize,
+    /// Function calls being evaluated right now (they nest through their arguments).
+    pub(crate) calls: Cell<usize>,
     /// Loops currently being executed in the running template (`break`/`continue` need one).
     pub(crate) loops: usize,
     /// Bytes stored by `assign`/`capture` so far.

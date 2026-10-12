@@ -101,3 +101,20 @@ test("the web build works too", async () => {
   assert.equal(web.render("Hello {{ n | uppercase }}", { n: "x" }), "Hello X");
   assert.equal(web.render("{{ n | money }}", { n: 2 }, undefined, { money: (v) => `$${v}` }), "$2");
 });
+
+test("custom functions", () => {
+  const functions = { add: (a, b) => a + b, year: () => 2026, list: (...xs) => xs, boom: () => { throw new Error("nope"); } };
+  const r = (t, ctx = { n: 5 }) => render(t, ctx, undefined, undefined, functions);
+  assert.equal(r("{{ add(n, 2) }}"), "7");
+  assert.equal(r("{{ year() }}"), "2026");
+  assert.equal(r("{{ add(add(1, 2), n) | plus: 1 }}"), "9");
+  assert.equal(r("{{ list('a,b', 'c(d)') | join: '|' }}"), "a,b|c(d)");
+  assert.equal(r("{{ add(n | plus: 1, 1) }}"), "7");
+  assert.equal(r("{% if add(n, 1) == 6 %}y{% endif %}{% if not add(0, 0) %}n{% endif %}"), "y");
+  assert.equal(r("{% assign x = add(1, 1) %}{{ x }}"), "2");
+  assert.equal(r("{{ '\"add(1, 2)' }}"), "\"add(1, 2)");
+  const err = (t) => { try { r(t); } catch (e) { return e.message; } return "did not throw"; };
+  assert.equal(err("{{ nope(1) }}"), "Unknown function: nope (line 1)");
+  assert.equal(err("{{ boom() }}"), "Function 'boom' failed: nope (line 1)");
+  assert.match(err("{{ " + "add(".repeat(30) + "1" + ")".repeat(30) + " }}"), /nested too deeply/);
+});

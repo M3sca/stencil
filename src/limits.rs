@@ -14,8 +14,10 @@ pub(crate) const MAX_NESTING: usize = 50;
 pub(crate) const MAX_RUN_DEPTH: usize = 100;
 /// Maximum size of a rendered output, in bytes.
 pub(crate) const MAX_OUTPUT: usize = 10 * 1024 * 1024;
-/// Work charged for each call of a filter supplied by the host (the call itself, and the JavaScript behind it, are not free).
+/// Work charged for each call of a filter or function supplied by the host (the call itself, and the JavaScript behind it, are not free).
 pub(crate) const CUSTOM_FILTER_COST: usize = 20;
+/// Nesting of function calls in one expression, e.g. `f(g(h(1)))`; bounds recursion depth.
+pub(crate) const MAX_CALL_DEPTH: usize = 20;
 /// Size of any single computed value (filter result, `assign`, `capture`), in bytes.
 pub(crate) const MAX_VALUE_SIZE: usize = 16 * 1024 * 1024;
 /// Total size of all values stored by `assign`/`capture` in one render, in bytes.

@@ -65,8 +65,16 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<Flow, St
                 }
             }
             Node::Case { subject, whens, otherwise } => {
-                let subject = value(subject, env).into_owned();
-                let hit = whens.iter().find(|(vals, _)| vals.iter().any(|v| *value(v, env) == subject));
+                let subject = value(subject, env)?.into_owned();
+                let mut hit = None;
+                'search: for w in whens {
+                    for v in &w.0 {
+                        if *value(v, env)? == subject {
+                            hit = Some(w);
+                            break 'search;
+                        }
+                    }
+                }
                 match (hit, otherwise) {
                     (Some((_, body)), _) | (None, Some(body)) => nested!(body),
                     (None, None) => {}
@@ -109,7 +117,7 @@ fn run_nodes(nodes: &[Node], env: &mut Env, out: &mut String) -> Result<Flow, St
                     }
                 };
                 // `with` values are evaluated in the caller's scope, then visible only inside the include.
-                let extra: Vec<_> = args.iter().map(|(k, e)| (k.clone(), value(e, env).into_owned())).collect();
+                let extra = args.iter().map(|(k, e)| Ok((k.clone(), value(e, env)?.into_owned()))).collect::<Result<Vec<_>, String>>()?;
                 let base = env.locals.len();
                 env.locals.extend(extra);
                 env.depth += 1;
@@ -196,6 +204,7 @@ pub fn render_with_filters(template: &str, ctx: &Context, partials: &Partials, f
         iterations: 0,
         steps: Cell::new(0),
         level: 0,
+        calls: Cell::new(0),
         loops: 0,
         assigned: 0,
         cache: HashMap::new(),

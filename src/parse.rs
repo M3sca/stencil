@@ -291,13 +291,15 @@ pub(crate) fn parse_include(tag: &str, arg: &str, line: usize) -> Result<Node, S
 
 /// Splits on `sep`, ignoring occurrences inside quotes.
 pub(crate) fn split_top(s: &str, sep: char) -> Vec<&str> {
-    let (mut parts, mut start, mut quote) = (Vec::new(), 0, None);
+    let (mut parts, mut start, mut quote, mut depth) = (Vec::new(), 0, None, 0usize);
     for (i, c) in s.char_indices() {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => {}
             None if c == '"' || c == '\'' => quote = Some(c),
-            None if c == sep => {
+            None if c == '(' => depth += 1,
+            None if c == ')' => depth = depth.saturating_sub(1),
+            None if c == sep && depth == 0 => {
                 parts.push(&s[start..i]);
                 start = i + c.len_utf8();
             }
@@ -306,4 +308,25 @@ pub(crate) fn split_top(s: &str, sep: char) -> Vec<&str> {
     }
     parts.push(&s[start..]);
     parts
+}
+
+/// Index of the `)` that closes the `(` at byte `open`, ignoring parentheses inside quotes.
+pub(crate) fn matching_paren(s: &str, open: usize) -> Option<usize> {
+    let (mut depth, mut quote) = (0usize, None);
+    for (i, c) in s[open..].char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '(' => depth += 1,
+            None if c == ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            None => {}
+        }
+    }
+    None
 }

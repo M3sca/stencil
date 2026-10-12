@@ -2,13 +2,46 @@
 
 use crate::Value;
 use crate::env::Env;
-use crate::limits::{CUSTOM_FILTER_COST, MAX_NESTING, MAX_VALUE_SIZE};
+use crate::limits::{CUSTOM_FILTER_COST, MAX_CALL_DEPTH, MAX_NESTING, MAX_VALUE_SIZE};
 use crate::filters::apply_filter;
-use crate::parse::split_top;
+use crate::parse::{matching_paren, split_top};
 use std::borrow::Cow;
 
-pub(crate) fn value<'a>(expr: &str, env: &'a Env) -> Cow<'a, Value> {
+/// A literal, a variable, or a function call `name(arg, ...)` (arguments are full expressions, filters included).
+pub(crate) fn value<'a>(expr: &str, env: &'a Env) -> Result<Cow<'a, Value>, String> {
     let e = expr.trim();
+    if let Some(open) = e.find('(')
+        && open > 0
+        && e[..open].chars().all(|c| c.is_alphanumeric() || c == '_')
+        && matching_paren(e, open) == Some(e.len() - 1)
+    {
+        return call(&e[..open], &e[open + 1..e.len() - 1], env).map(Cow::Owned);
+    }
+    Ok(lookup(e, env))
+}
+
+fn call(name: &str, args: &str, env: &Env) -> Result<Value, String> {
+    if env.calls.get() >= MAX_CALL_DEPTH {
+        return Err(format!("Function calls nested too deeply (max {MAX_CALL_DEPTH} levels)"));
+    }
+    env.calls.set(env.calls.get() + 1);
+    let args: Result<Vec<Value>, String> = if args.trim().is_empty() {
+        Ok(vec![])
+    } else {
+        split_top(args, ',').iter().map(|a| output(a, env).map(Cow::into_owned)).collect()
+    };
+    env.calls.set(env.calls.get() - 1);
+    let args = args?;
+    env.charge(CUSTOM_FILTER_COST)?;
+    let out = env.custom.function(name, &args).ok_or_else(|| format!("Unknown function: {name}"))?;
+    let out = out.map_err(|e| format!("Function '{name}' failed: {e}"))?;
+    if out.weight() > MAX_VALUE_SIZE {
+        return Err(format!("Function '{name}' returned a value that is too large (max {MAX_VALUE_SIZE} bytes)"));
+    }
+    Ok(out)
+}
+
+fn lookup<'a>(e: &str, env: &'a Env) -> Cow<'a, Value> {
     if e.len() >= 2 && (e.starts_with('"') && e.ends_with('"') || e.starts_with('\'') && e.ends_with('\'')) {
         return Cow::Owned(Value::Str(e[1..e.len() - 1].into()));
     }
@@ -41,13 +74,13 @@ pub(crate) fn value<'a>(expr: &str, env: &'a Env) -> Cow<'a, Value> {
 
 pub(crate) fn output<'a>(expr: &str, env: &'a Env) -> Result<Cow<'a, Value>, String> {
     let mut pipes = split_top(expr, '|').into_iter();
-    let mut v = value(pipes.next().unwrap(), env);
+    let mut v = value(pipes.next().unwrap(), env)?;
     for p in pipes {
         let (name, args) = p.split_once(':').unwrap_or((p, ""));
         let args: Vec<Value> = if args.trim().is_empty() {
             vec![]
         } else {
-            split_top(args, ',').iter().map(|a| value(a, env).into_owned()).collect()
+            split_top(args, ',').iter().map(|a| value(a, env).map(Cow::into_owned)).collect::<Result<_, _>>()?
         };
         env.charge(v.weight() / 256)?;
         let name = name.trim();
@@ -112,6 +145,13 @@ pub(crate) fn cond_tokens(s: &str) -> Result<Vec<String>, String> {
                     if d.is_whitespace() || "()=!<>\"'".contains(d) { break; }
                     end = j + d.len_utf8();
                     it.next();
+                }
+                // `name(args)` is one token: a function call, unless the word is an operator.
+                if end < s.len() && s[end..].starts_with('(') && !matches!(&s[i..end], "not" | "and" | "or" | "contains")
+                    && let Some(close) = matching_paren(s, end)
+                {
+                    end = close + 1;
+                    while it.next_if(|&(j, _)| j < end).is_some() {}
                 }
             }
         }
@@ -196,7 +236,7 @@ impl<'a> Cond<'a> {
             self.i += 1;
             return Ok(v);
         }
-        Ok(value(&t, self.env))
+        value(&t, self.env)
     }
 }
 
